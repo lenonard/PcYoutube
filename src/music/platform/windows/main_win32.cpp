@@ -1,830 +1,888 @@
 #include <windows.h>
-#include <commctrl.h>
+#include <d3d11.h>
+#include <dwmapi.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
-#include <filesystem>
-#include <memory>
-#include <sstream>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <mutex>
+#include <optional>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <vector>
 
+#include <imgui.h>
+#include <imgui_impl_dx11.h>
+#include <imgui_impl_win32.h>
+
+#include "audio_backend.h"
 #include "music_app.h"
+
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "dwmapi.lib")
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 namespace {
 
-constexpr int kInputId = 1001;
-constexpr int kPlayId = 1002;
-constexpr int kPauseId = 1003;
-constexpr int kStopId = 1004;
-constexpr int kCopyId = 1005;
-constexpr int kVolumeId = 1006;
-constexpr UINT kResolvedMessage = WM_APP + 1;
+using pcyoutube::music::AudioQuality;
+using pcyoutube::windows::AudioBackend;
+using pcyoutube::windows::BackendResult;
+using pcyoutube::windows::PlaybackSnapshot;
+using pcyoutube::windows::SearchTrack;
+using pcyoutube::windows::TrackInfo;
 
-HWND g_main_window = nullptr;
-HWND g_input_edit = nullptr;
-HWND g_play_button = nullptr;
-HWND g_pause_button = nullptr;
-HWND g_stop_button = nullptr;
-HWND g_copy_button = nullptr;
-HWND g_volume_slider = nullptr;
-HWND g_title_text = nullptr;
-HWND g_direct_edit = nullptr;
-HWND g_status_text = nullptr;
+ID3D11Device* g_device = nullptr;
+ID3D11DeviceContext* g_device_context = nullptr;
+IDXGISwapChain* g_swap_chain = nullptr;
+ID3D11RenderTargetView* g_main_render_target = nullptr;
+UINT g_resize_width = 0;
+UINT g_resize_height = 0;
 
-std::filesystem::path g_exe_dir;
-std::filesystem::path g_yt_dlp_path;
-std::filesystem::path g_mpv_path;
-std::wstring g_mpv_pipe_name;
-HANDLE g_mpv_process = nullptr;
-std::atomic_bool g_resolving{false};
+AudioBackend* g_backend = nullptr;
+std::jthread g_search_thread;
+std::jthread g_resolve_thread;
+std::jthread g_poll_thread;
+std::atomic_bool g_search_busy{false};
+std::atomic_bool g_resolve_busy{false};
 
-struct ResolveResult {
-    bool ok = false;
-    std::string title;
-    std::string url;
-    std::string error;
+std::mutex g_async_mutex;
+std::optional<std::vector<SearchTrack>> g_pending_search_results;
+std::optional<std::string> g_pending_search_error;
+
+struct PendingResolve {
+    BackendResult result;
+    int search_index = -1;
 };
+std::optional<PendingResolve> g_pending_resolve;
 
-std::wstring utf8_to_wide(std::string_view text) {
-    if (text.empty()) {
-        return {};
-    }
+std::mutex g_playback_mutex;
+PlaybackSnapshot g_playback;
 
-    int size = MultiByteToWideChar(
-        CP_UTF8,
-        MB_ERR_INVALID_CHARS,
-        text.data(),
-        static_cast<int>(text.size()),
-        nullptr,
-        0);
+std::vector<SearchTrack> g_search_results;
+std::optional<TrackInfo> g_current_track;
+std::string g_search_error;
+std::string g_status = "Ready";
+int g_current_index = -1;
+int g_quality_index = 0;
+int g_volume = 75;
+std::array<char, 1024> g_search_buffer{};
+bool g_focus_search = true;
+bool g_seek_dragging = false;
+float g_seek_value = 0.0f;
 
-    DWORD flags = MB_ERR_INVALID_CHARS;
-    if (size <= 0) {
-        flags = 0;
-        size = MultiByteToWideChar(
-            CP_UTF8,
-            flags,
-            text.data(),
-            static_cast<int>(text.size()),
-            nullptr,
-            0);
-    }
+ImFont* g_font_body = nullptr;
+ImFont* g_font_small = nullptr;
+ImFont* g_font_heading = nullptr;
+ImFont* g_font_display = nullptr;
 
-    if (size <= 0) {
-        return {};
-    }
+constexpr ImVec4 kAccent = ImVec4(0.25f, 0.78f, 0.48f, 1.0f);
+constexpr ImVec4 kAccentHover = ImVec4(0.31f, 0.86f, 0.55f, 1.0f);
+constexpr ImVec4 kPanel = ImVec4(0.075f, 0.082f, 0.105f, 1.0f);
+constexpr ImVec4 kCard = ImVec4(0.105f, 0.115f, 0.145f, 1.0f);
+constexpr ImVec4 kMuted = ImVec4(0.58f, 0.61f, 0.68f, 1.0f);
 
-    std::wstring result(static_cast<std::size_t>(size), L'\0');
-    MultiByteToWideChar(
-        CP_UTF8,
-        flags,
-        text.data(),
-        static_cast<int>(text.size()),
-        result.data(),
-        size);
-    return result;
-}
+bool create_device_d3d(HWND window) {
+    DXGI_SWAP_CHAIN_DESC swap_desc{};
+    swap_desc.BufferCount = 2;
+    swap_desc.BufferDesc.Width = 0;
+    swap_desc.BufferDesc.Height = 0;
+    swap_desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    swap_desc.BufferDesc.RefreshRate.Numerator = 60;
+    swap_desc.BufferDesc.RefreshRate.Denominator = 1;
+    swap_desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    swap_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    swap_desc.OutputWindow = window;
+    swap_desc.SampleDesc.Count = 1;
+    swap_desc.SampleDesc.Quality = 0;
+    swap_desc.Windowed = TRUE;
+    swap_desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
-std::string wide_to_utf8(std::wstring_view text) {
-    if (text.empty()) {
-        return {};
-    }
-
-    const int size = WideCharToMultiByte(
-        CP_UTF8,
-        0,
-        text.data(),
-        static_cast<int>(text.size()),
-        nullptr,
-        0,
-        nullptr,
-        nullptr);
-
-    if (size <= 0) {
-        return {};
-    }
-
-    std::string result(static_cast<std::size_t>(size), '\0');
-    WideCharToMultiByte(
-        CP_UTF8,
-        0,
-        text.data(),
-        static_cast<int>(text.size()),
-        result.data(),
-        size,
-        nullptr,
-        nullptr);
-    return result;
-}
-
-std::wstring read_window_text(HWND control) {
-    const int length = GetWindowTextLengthW(control);
-    if (length <= 0) {
-        return {};
-    }
-
-    std::wstring value(static_cast<std::size_t>(length) + 1U, L'\0');
-    const int copied = GetWindowTextW(control, value.data(), length + 1);
-    if (copied <= 0) {
-        return {};
-    }
-    value.resize(static_cast<std::size_t>(copied));
-    return value;
-}
-
-void set_text(HWND control, std::wstring_view text) {
-    if (control != nullptr) {
-        const std::wstring copy(text);
-        SetWindowTextW(control, copy.c_str());
-    }
-}
-
-void set_status(std::wstring_view text) {
-    set_text(g_status_text, text);
-}
-
-bool file_exists(const std::filesystem::path& path) {
-    std::error_code error;
-    return std::filesystem::exists(path, error) && !error;
-}
-
-std::filesystem::path executable_directory() {
-    std::wstring buffer(32768, L'\0');
-    const DWORD length = GetModuleFileNameW(
-        nullptr,
-        buffer.data(),
-        static_cast<DWORD>(buffer.size()));
-    if (length == 0 || length >= buffer.size()) {
-        return std::filesystem::current_path();
-    }
-    buffer.resize(length);
-    return std::filesystem::path(buffer).parent_path();
-}
-
-std::wstring quote_argument(std::wstring_view argument) {
-    if (argument.empty()) {
-        return L"\"\"";
-    }
-
-    if (argument.find_first_of(L" \t\"") == std::wstring_view::npos) {
-        return std::wstring(argument);
-    }
-
-    std::wstring result = L"\"";
-    std::size_t backslashes = 0;
-
-    for (const wchar_t ch : argument) {
-        if (ch == L'\\') {
-            ++backslashes;
-            continue;
-        }
-
-        if (ch == L'\"') {
-            result.append(backslashes * 2U + 1U, L'\\');
-            result.push_back(L'\"');
-            backslashes = 0;
-            continue;
-        }
-
-        result.append(backslashes, L'\\');
-        backslashes = 0;
-        result.push_back(ch);
-    }
-
-    result.append(backslashes * 2U, L'\\');
-    result.push_back(L'\"');
-    return result;
-}
-
-std::string run_process_capture(
-    const std::filesystem::path& executable,
-    const std::vector<std::wstring>& arguments,
-    DWORD& exit_code) {
-    exit_code = static_cast<DWORD>(-1);
-
-    SECURITY_ATTRIBUTES security{};
-    security.nLength = sizeof(security);
-    security.bInheritHandle = TRUE;
-
-    HANDLE read_pipe = nullptr;
-    HANDLE write_pipe = nullptr;
-    if (!CreatePipe(&read_pipe, &write_pipe, &security, 0)) {
-        return "Could not create output pipe.";
-    }
-
-    SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    startup.wShowWindow = SW_HIDE;
-    startup.hStdOutput = write_pipe;
-    startup.hStdError = write_pipe;
-    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-
-    PROCESS_INFORMATION process{};
-    std::wstring command_line = quote_argument(executable.wstring());
-    for (const auto& argument : arguments) {
-        command_line.push_back(L' ');
-        command_line += quote_argument(argument);
-    }
-
-    const std::wstring working_directory = executable.parent_path().wstring();
-    const BOOL created = CreateProcessW(
-        executable.c_str(),
-        command_line.data(),
-        nullptr,
-        nullptr,
-        TRUE,
-        CREATE_NO_WINDOW,
-        nullptr,
-        working_directory.empty() ? nullptr : working_directory.c_str(),
-        &startup,
-        &process);
-
-    CloseHandle(write_pipe);
-
-    if (!created) {
-        CloseHandle(read_pipe);
-        return "Could not start process. Win32 error=" + std::to_string(GetLastError());
-    }
-
-    CloseHandle(process.hThread);
-
-    std::string output;
-    char buffer[4096];
-    DWORD bytes_read = 0;
-    while (ReadFile(read_pipe, buffer, sizeof(buffer), &bytes_read, nullptr) && bytes_read > 0) {
-        output.append(buffer, buffer + bytes_read);
-    }
-
-    CloseHandle(read_pipe);
-    WaitForSingleObject(process.hProcess, INFINITE);
-    GetExitCodeProcess(process.hProcess, &exit_code);
-    CloseHandle(process.hProcess);
-    return output;
-}
-
-std::string trim_line(std::string value) {
-    while (!value.empty() && (value.back() == '\r' || value.back() == '\n')) {
-        value.pop_back();
-    }
-    return value;
-}
-
-ResolveResult resolve_audio(std::string_view target) {
-    ResolveResult result;
-
-    const std::vector<std::wstring> arguments = {
-        L"--no-config",
-        L"--no-playlist",
-        L"--no-warnings",
-        L"--no-progress",
-        L"--no-color",
-        L"--simulate",
-        L"--format",
-        L"bestaudio[ext=m4a]/bestaudio",
-        L"--print",
-        L"PCY_TITLE=%(title)s",
-        L"--print",
-        L"PCY_URL=%(url)s",
-        utf8_to_wide(target)
+    UINT create_flags = 0;
+    D3D_FEATURE_LEVEL feature_level;
+    const D3D_FEATURE_LEVEL feature_levels[] = {
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_0,
     };
 
-    DWORD exit_code = 0;
-    const std::string output = run_process_capture(g_yt_dlp_path, arguments, exit_code);
-
-    std::istringstream stream(output);
-    std::string line;
-    while (std::getline(stream, line)) {
-        line = trim_line(std::move(line));
-        constexpr std::string_view title_prefix = "PCY_TITLE=";
-        constexpr std::string_view url_prefix = "PCY_URL=";
-
-        if (line.rfind(title_prefix, 0) == 0) {
-            result.title = line.substr(title_prefix.size());
-        } else if (line.rfind(url_prefix, 0) == 0) {
-            result.url = line.substr(url_prefix.size());
-        }
+    const HRESULT result = D3D11CreateDeviceAndSwapChain(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, create_flags, feature_levels,
+        static_cast<UINT>(std::size(feature_levels)), D3D11_SDK_VERSION, &swap_desc,
+        &g_swap_chain, &g_device, &feature_level, &g_device_context);
+    if (result == DXGI_ERROR_UNSUPPORTED) {
+        return SUCCEEDED(D3D11CreateDeviceAndSwapChain(
+            nullptr, D3D_DRIVER_TYPE_WARP, nullptr, create_flags, feature_levels,
+            static_cast<UINT>(std::size(feature_levels)), D3D11_SDK_VERSION, &swap_desc,
+            &g_swap_chain, &g_device, &feature_level, &g_device_context));
     }
-
-    if (exit_code == 0 && !result.url.empty()) {
-        result.ok = true;
-        if (result.title.empty()) {
-            result.title = "YouTube audio";
-        }
-        return result;
-    }
-
-    result.error = output;
-    if (result.error.empty()) {
-        result.error = "yt-dlp did not return an audio URL.";
-    }
-    if (result.error.size() > 900U) {
-        result.error.resize(900U);
-        result.error += "...";
-    }
-    return result;
+    return SUCCEEDED(result);
 }
 
-std::string json_escape(std::string_view value) {
-    std::string result;
-    result.reserve(value.size() + 32U);
-
-    for (const unsigned char ch : value) {
-        switch (ch) {
-        case '\\': result += "\\\\"; break;
-        case '"': result += "\\\""; break;
-        case '\n': result += "\\n"; break;
-        case '\r': result += "\\r"; break;
-        case '\t': result += "\\t"; break;
-        default:
-            if (ch >= 0x20U) {
-                result.push_back(static_cast<char>(ch));
-            }
-            break;
-        }
-    }
-    return result;
-}
-
-bool start_mpv() {
-    if (g_mpv_process != nullptr) {
-        DWORD exit_code = 0;
-        if (GetExitCodeProcess(g_mpv_process, &exit_code) && exit_code == STILL_ACTIVE) {
-            return true;
-        }
-        CloseHandle(g_mpv_process);
-        g_mpv_process = nullptr;
-    }
-
-    if (!file_exists(g_mpv_path)) {
-        return false;
-    }
-
-    g_mpv_pipe_name = L"\\\\.\\pipe\\PcYoutubeMpv_" + std::to_wstring(GetCurrentProcessId());
-
-    const std::vector<std::wstring> arguments = {
-        L"--idle=yes",
-        L"--no-video",
-        L"--audio-display=no",
-        L"--force-window=no",
-        L"--no-terminal",
-        L"--really-quiet",
-        L"--volume=75",
-        L"--input-ipc-server=" + g_mpv_pipe_name
-    };
-
-    std::wstring command_line = quote_argument(g_mpv_path.wstring());
-    for (const auto& argument : arguments) {
-        command_line.push_back(L' ');
-        command_line += quote_argument(argument);
-    }
-
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    startup.dwFlags = STARTF_USESHOWWINDOW;
-    startup.wShowWindow = SW_HIDE;
-
-    PROCESS_INFORMATION process{};
-    const std::wstring working_directory = g_mpv_path.parent_path().wstring();
-    const BOOL created = CreateProcessW(
-        g_mpv_path.c_str(),
-        command_line.data(),
-        nullptr,
-        nullptr,
-        FALSE,
-        CREATE_NO_WINDOW,
-        nullptr,
-        working_directory.c_str(),
-        &startup,
-        &process);
-
-    if (!created) {
-        return false;
-    }
-
-    CloseHandle(process.hThread);
-    g_mpv_process = process.hProcess;
-    return true;
-}
-
-bool send_mpv_command(std::string_view command) {
-    if (!start_mpv()) {
-        return false;
-    }
-
-    HANDLE pipe = INVALID_HANDLE_VALUE;
-    for (int attempt = 0; attempt < 30; ++attempt) {
-        pipe = CreateFileW(
-            g_mpv_pipe_name.c_str(),
-            GENERIC_WRITE,
-            0,
-            nullptr,
-            OPEN_EXISTING,
-            0,
-            nullptr);
-
-        if (pipe != INVALID_HANDLE_VALUE) {
-            break;
-        }
-
-        if (GetLastError() == ERROR_PIPE_BUSY) {
-            WaitNamedPipeW(g_mpv_pipe_name.c_str(), 100);
-        } else {
-            Sleep(50);
-        }
-    }
-
-    if (pipe == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-
-    std::string line(command);
-    line.push_back('\n');
-    DWORD written = 0;
-    const BOOL ok = WriteFile(
-        pipe,
-        line.data(),
-        static_cast<DWORD>(line.size()),
-        &written,
-        nullptr);
-    CloseHandle(pipe);
-    return ok && written == line.size();
-}
-
-void stop_mpv_process() {
-    if (g_mpv_process == nullptr) {
-        return;
-    }
-
-    send_mpv_command(R"({"command":["quit"]})");
-    if (WaitForSingleObject(g_mpv_process, 400) == WAIT_TIMEOUT) {
-        TerminateProcess(g_mpv_process, 0);
-        WaitForSingleObject(g_mpv_process, 400);
-    }
-    CloseHandle(g_mpv_process);
-    g_mpv_process = nullptr;
-}
-
-bool copy_to_clipboard(std::wstring_view text) {
-    if (!OpenClipboard(g_main_window)) {
-        return false;
-    }
-
-    EmptyClipboard();
-    const SIZE_T bytes = (text.size() + 1U) * sizeof(wchar_t);
-    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
-    if (memory == nullptr) {
-        CloseClipboard();
-        return false;
-    }
-
-    void* destination = GlobalLock(memory);
-    if (destination == nullptr) {
-        GlobalFree(memory);
-        CloseClipboard();
-        return false;
-    }
-
-    memcpy(destination, text.data(), text.size() * sizeof(wchar_t));
-    static_cast<wchar_t*>(destination)[text.size()] = L'\0';
-    GlobalUnlock(memory);
-
-    if (SetClipboardData(CF_UNICODETEXT, memory) == nullptr) {
-        GlobalFree(memory);
-        CloseClipboard();
-        return false;
-    }
-
-    CloseClipboard();
-    return true;
-}
-
-void layout_controls() {
-    if (g_main_window == nullptr) {
-        return;
-    }
-
-    RECT client{};
-    GetClientRect(g_main_window, &client);
-    const int width = client.right - client.left;
-    const int height = client.bottom - client.top;
-
-    constexpr int margin = 16;
-    constexpr int button_width = 96;
-    constexpr int row_height = 30;
-
-    if (g_input_edit) {
-        MoveWindow(g_input_edit, margin, 36, width - margin * 3 - button_width, row_height, TRUE);
-    }
-    if (g_play_button) {
-        MoveWindow(g_play_button, width - margin - button_width, 36, button_width, row_height, TRUE);
-    }
-
-    if (g_pause_button) {
-        MoveWindow(g_pause_button, margin, 82, 128, row_height, TRUE);
-    }
-    if (g_stop_button) {
-        MoveWindow(g_stop_button, margin + 138, 82, 86, row_height, TRUE);
-    }
-    if (g_volume_slider) {
-        MoveWindow(g_volume_slider, margin + 292, 80, width - margin * 2 - 292, 34, TRUE);
-    }
-
-    if (g_title_text) {
-        MoveWindow(g_title_text, margin, 132, width - margin * 2, 22, TRUE);
-    }
-    if (g_direct_edit) {
-        MoveWindow(g_direct_edit, margin, 164, width - margin * 3 - button_width, row_height, TRUE);
-    }
-    if (g_copy_button) {
-        MoveWindow(g_copy_button, width - margin - button_width, 164, button_width, row_height, TRUE);
-    }
-    if (g_status_text) {
-        MoveWindow(g_status_text, margin, height - 34, width - margin * 2, 22, TRUE);
+void create_render_target() {
+    ID3D11Texture2D* back_buffer = nullptr;
+    if (SUCCEEDED(g_swap_chain->GetBuffer(0, IID_PPV_ARGS(&back_buffer)))) {
+        g_device->CreateRenderTargetView(back_buffer, nullptr, &g_main_render_target);
+        back_buffer->Release();
     }
 }
 
-void begin_resolve_and_play() {
-    if (g_resolving.exchange(true)) {
-        return;
+void cleanup_render_target() {
+    if (g_main_render_target != nullptr) {
+        g_main_render_target->Release();
+        g_main_render_target = nullptr;
     }
-
-    const std::string input = wide_to_utf8(read_window_text(g_input_edit));
-    const std::string target = pcyoutube::music::make_yt_dlp_target(input);
-
-    if (target.empty()) {
-        g_resolving = false;
-        set_status(L"Enter a YouTube URL, video ID, or search text.");
-        return;
-    }
-
-    if (!file_exists(g_yt_dlp_path)) {
-        g_resolving = false;
-        set_status(L"Missing tools\\yt-dlp.exe next to PcYoutube.exe.");
-        return;
-    }
-
-    if (!file_exists(g_mpv_path)) {
-        g_resolving = false;
-        set_status(L"Missing tools\\mpv\\mpv.exe next to PcYoutube.exe.");
-        return;
-    }
-
-    EnableWindow(g_play_button, FALSE);
-    set_status(L"Resolving a fresh audio-only stream URL with yt-dlp...");
-
-    std::thread([target]() {
-        auto result = std::make_unique<ResolveResult>(resolve_audio(target));
-        HWND window = g_main_window;
-        if (window != nullptr && IsWindow(window) &&
-            PostMessageW(window, kResolvedMessage, 0, reinterpret_cast<LPARAM>(result.get()))) {
-            result.release();
-            return;
-        }
-        g_resolving = false;
-    }).detach();
 }
 
-LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param) {
+void cleanup_device_d3d() {
+    cleanup_render_target();
+    if (g_swap_chain != nullptr) {
+        g_swap_chain->Release();
+        g_swap_chain = nullptr;
+    }
+    if (g_device_context != nullptr) {
+        g_device_context->Release();
+        g_device_context = nullptr;
+    }
+    if (g_device != nullptr) {
+        g_device->Release();
+        g_device = nullptr;
+    }
+}
+
+void apply_dark_title_bar(HWND window) {
+    constexpr DWORD kUseImmersiveDarkMode = 20;
+    BOOL enabled = TRUE;
+    DwmSetWindowAttribute(window, kUseImmersiveDarkMode, &enabled, sizeof(enabled));
+}
+
+LRESULT WINAPI window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l_param) {
+    if (ImGui_ImplWin32_WndProcHandler(window, message, w_param, l_param)) {
+        return true;
+    }
+
     switch (message) {
-    case WM_CREATE: {
-        g_main_window = hwnd;
-        HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-
-        HWND input_label = CreateWindowExW(
-            0, L"STATIC", L"YouTube URL / video ID / search text", WS_CHILD | WS_VISIBLE,
-            16, 14, 400, 20, hwnd, nullptr, nullptr, nullptr);
-
-        g_input_edit = CreateWindowExW(
-            WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-            16, 36, 600, 30, hwnd,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kInputId)), nullptr, nullptr);
-
-        g_play_button = CreateWindowExW(
-            0, L"BUTTON", L"Resolve + Play",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            630, 36, 110, 30, hwnd,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kPlayId)), nullptr, nullptr);
-
-        g_pause_button = CreateWindowExW(
-            0, L"BUTTON", L"Pause / Resume",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            16, 82, 128, 30, hwnd,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kPauseId)), nullptr, nullptr);
-
-        g_stop_button = CreateWindowExW(
-            0, L"BUTTON", L"Stop",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            154, 82, 86, 30, hwnd,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStopId)), nullptr, nullptr);
-
-        HWND volume_label = CreateWindowExW(
-            0, L"STATIC", L"Volume", WS_CHILD | WS_VISIBLE,
-            252, 87, 58, 20, hwnd, nullptr, nullptr, nullptr);
-
-        g_volume_slider = CreateWindowExW(
-            0, TRACKBAR_CLASSW, L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_AUTOTICKS,
-            308, 80, 420, 34, hwnd,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kVolumeId)), nullptr, nullptr);
-        SendMessageW(g_volume_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
-        SendMessageW(g_volume_slider, TBM_SETPOS, TRUE, 75);
-
-        g_title_text = CreateWindowExW(
-            0, L"STATIC", L"Now playing: -", WS_CHILD | WS_VISIBLE | SS_LEFT,
-            16, 132, 720, 22, hwnd, nullptr, nullptr, nullptr);
-
-        g_direct_edit = CreateWindowExW(
-            WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_READONLY,
-            16, 164, 600, 30, hwnd, nullptr, nullptr, nullptr);
-
-        g_copy_button = CreateWindowExW(
-            0, L"BUTTON", L"Copy URL",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            630, 164, 96, 30, hwnd,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCopyId)), nullptr, nullptr);
-
-        g_status_text = CreateWindowExW(
-            0, L"STATIC", L"Ready. No WebView is used.", WS_CHILD | WS_VISIBLE | SS_LEFT,
-            16, 212, 720, 22, hwnd, nullptr, nullptr, nullptr);
-
-        for (HWND control : {
-                 input_label, g_input_edit, g_play_button, g_pause_button, g_stop_button,
-                 volume_label, g_volume_slider, g_title_text, g_direct_edit,
-                 g_copy_button, g_status_text}) {
-            if (control != nullptr) {
-                SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
-            }
-        }
-
-        layout_controls();
-        return 0;
-    }
-
     case WM_SIZE:
-        layout_controls();
+        if (w_param == SIZE_MINIMIZED) return 0;
+        g_resize_width = static_cast<UINT>(LOWORD(l_param));
+        g_resize_height = static_cast<UINT>(HIWORD(l_param));
         return 0;
-
-    case WM_COMMAND:
-        switch (LOWORD(w_param)) {
-        case kPlayId:
-            if (HIWORD(w_param) == BN_CLICKED) {
-                begin_resolve_and_play();
-                return 0;
-            }
-            break;
-        case kPauseId:
-            if (HIWORD(w_param) == BN_CLICKED) {
-                if (send_mpv_command(R"({"command":["cycle","pause"]})")) {
-                    set_status(L"Pause/resume toggled.");
-                } else {
-                    set_status(L"mpv is not available.");
-                }
-                return 0;
-            }
-            break;
-        case kStopId:
-            if (HIWORD(w_param) == BN_CLICKED) {
-                if (send_mpv_command(R"({"command":["stop"]})")) {
-                    set_status(L"Stopped.");
-                }
-                return 0;
-            }
-            break;
-        case kCopyId:
-            if (HIWORD(w_param) == BN_CLICKED) {
-                const std::wstring url = read_window_text(g_direct_edit);
-                if (!url.empty() && copy_to_clipboard(url)) {
-                    set_status(L"Direct audio URL copied to clipboard.");
-                }
-                return 0;
-            }
-            break;
-        default:
-            break;
-        }
+    case WM_SYSCOMMAND:
+        if ((w_param & 0xfff0) == SC_KEYMENU) return 0;
         break;
-
-    case WM_HSCROLL:
-        if (reinterpret_cast<HWND>(l_param) == g_volume_slider) {
-            const int volume = static_cast<int>(SendMessageW(g_volume_slider, TBM_GETPOS, 0, 0));
-            const std::string command =
-                "{\"command\":[\"set_property\",\"volume\"," + std::to_string(volume) + "]}";
-            send_mpv_command(command);
-            return 0;
-        }
-        break;
-
-    case kResolvedMessage: {
-        std::unique_ptr<ResolveResult> result(reinterpret_cast<ResolveResult*>(l_param));
-        g_resolving = false;
-        EnableWindow(g_play_button, TRUE);
-
-        if (!result || !result->ok) {
-            std::wstring error = result ? utf8_to_wide(result->error) : L"Unknown resolver error.";
-            for (wchar_t& ch : error) {
-                if (ch == L'\r' || ch == L'\n') {
-                    ch = L' ';
-                }
-            }
-            set_status(L"yt-dlp error: " + error);
-            return 0;
-        }
-
-        set_text(g_title_text, L"Now playing: " + utf8_to_wide(result->title));
-        set_text(g_direct_edit, utf8_to_wide(result->url));
-
-        if (!start_mpv()) {
-            set_status(L"Resolved audio URL, but mpv could not start.");
-            return 0;
-        }
-
-        const std::string command =
-            "{\"command\":[\"loadfile\",\"" + json_escape(result->url) + "\",\"replace\"]}";
-        if (send_mpv_command(command)) {
-            set_status(L"Playing direct audio stream. The URL is shown above and can be copied.");
-        } else {
-            set_status(L"Resolved audio URL, but could not send it to mpv.");
-        }
-        return 0;
-    }
-
     case WM_DESTROY:
-        g_main_window = nullptr;
-        stop_mpv_process();
         PostQuitMessage(0);
         return 0;
-
     default:
         break;
     }
+    return DefWindowProcW(window, message, w_param, l_param);
+}
 
-    return DefWindowProcW(hwnd, message, w_param, l_param);
+void configure_style() {
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.WindowPadding = ImVec2(18.0f, 18.0f);
+    style.FramePadding = ImVec2(12.0f, 9.0f);
+    style.ItemSpacing = ImVec2(10.0f, 10.0f);
+    style.ItemInnerSpacing = ImVec2(8.0f, 6.0f);
+    style.ScrollbarSize = 11.0f;
+    style.GrabMinSize = 10.0f;
+    style.WindowRounding = 0.0f;
+    style.ChildRounding = 14.0f;
+    style.FrameRounding = 10.0f;
+    style.PopupRounding = 10.0f;
+    style.ScrollbarRounding = 10.0f;
+    style.GrabRounding = 10.0f;
+    style.TabRounding = 9.0f;
+    style.WindowBorderSize = 0.0f;
+    style.ChildBorderSize = 1.0f;
+    style.FrameBorderSize = 0.0f;
+
+    auto& colors = style.Colors;
+    colors[ImGuiCol_Text] = ImVec4(0.94f, 0.95f, 0.98f, 1.0f);
+    colors[ImGuiCol_TextDisabled] = kMuted;
+    colors[ImGuiCol_WindowBg] = ImVec4(0.045f, 0.049f, 0.064f, 1.0f);
+    colors[ImGuiCol_ChildBg] = kPanel;
+    colors[ImGuiCol_PopupBg] = ImVec4(0.08f, 0.085f, 0.11f, 1.0f);
+    colors[ImGuiCol_Border] = ImVec4(0.18f, 0.19f, 0.24f, 0.72f);
+    colors[ImGuiCol_FrameBg] = ImVec4(0.10f, 0.11f, 0.14f, 1.0f);
+    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.14f, 0.15f, 0.19f, 1.0f);
+    colors[ImGuiCol_FrameBgActive] = ImVec4(0.16f, 0.17f, 0.22f, 1.0f);
+    colors[ImGuiCol_Button] = ImVec4(0.12f, 0.13f, 0.17f, 1.0f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.18f, 0.19f, 0.24f, 1.0f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.21f, 0.22f, 0.28f, 1.0f);
+    colors[ImGuiCol_Header] = ImVec4(0.16f, 0.18f, 0.22f, 1.0f);
+    colors[ImGuiCol_HeaderHovered] = ImVec4(0.20f, 0.22f, 0.28f, 1.0f);
+    colors[ImGuiCol_HeaderActive] = ImVec4(0.23f, 0.25f, 0.31f, 1.0f);
+    colors[ImGuiCol_CheckMark] = kAccent;
+    colors[ImGuiCol_SliderGrab] = kAccent;
+    colors[ImGuiCol_SliderGrabActive] = kAccentHover;
+    colors[ImGuiCol_Separator] = ImVec4(0.17f, 0.18f, 0.22f, 1.0f);
+    colors[ImGuiCol_ResizeGrip] = kAccent;
+    colors[ImGuiCol_NavHighlight] = kAccent;
+}
+
+void load_fonts() {
+    ImGuiIO& io = ImGui::GetIO();
+    const char* segoe = "C:\\Windows\\Fonts\\segoeui.ttf";
+    const char* segoe_semibold = "C:\\Windows\\Fonts\\seguisb.ttf";
+
+    g_font_body = io.Fonts->AddFontFromFileTTF(segoe, 18.0f);
+    if (g_font_body != nullptr) io.FontDefault = g_font_body;
+    g_font_small = io.Fonts->AddFontFromFileTTF(segoe, 15.0f);
+    g_font_heading = io.Fonts->AddFontFromFileTTF(segoe_semibold, 24.0f);
+    g_font_display = io.Fonts->AddFontFromFileTTF(segoe_semibold, 31.0f);
+}
+
+AudioQuality selected_quality() {
+    return static_cast<AudioQuality>(std::clamp(g_quality_index, 0, 3));
+}
+
+std::string watch_url_for(const SearchTrack& track) {
+    return track.id.empty() ? std::string{} :
+           "https://www.youtube.com/watch?v=" + track.id;
+}
+
+bool input_is_direct_target() {
+    const std::string input(g_search_buffer.data());
+    return pcyoutube::music::looks_like_http_url(input) ||
+           pcyoutube::music::extract_video_id(input).has_value();
+}
+
+void start_search(std::string query) {
+    if (g_backend == nullptr || g_search_busy.exchange(true)) return;
+    if (query.empty()) {
+        g_search_busy = false;
+        return;
+    }
+
+    if (g_search_thread.joinable()) g_search_thread.join();
+    g_search_error.clear();
+    g_status = "Searching YouTube...";
+
+    g_search_thread = std::jthread([query = std::move(query)] {
+        std::string error;
+        auto results = g_backend->search(query, 16, error);
+        {
+            std::lock_guard lock(g_async_mutex);
+            g_pending_search_results = std::move(results);
+            g_pending_search_error = std::move(error);
+        }
+        g_search_busy = false;
+    });
+}
+
+void start_resolve(std::string target, int search_index) {
+    if (g_backend == nullptr || g_resolve_busy.exchange(true)) return;
+    if (target.empty()) {
+        g_resolve_busy = false;
+        return;
+    }
+
+    if (g_resolve_thread.joinable()) g_resolve_thread.join();
+    const AudioQuality quality = selected_quality();
+    g_status = "Resolving direct audio stream...";
+
+    g_resolve_thread = std::jthread([target = std::move(target), search_index, quality] {
+        BackendResult result = g_backend->resolve(target, quality);
+        {
+            std::lock_guard lock(g_async_mutex);
+            g_pending_resolve = PendingResolve{std::move(result), search_index};
+        }
+        g_resolve_busy = false;
+    });
+}
+
+void start_track_index(int index) {
+    if (index < 0 || index >= static_cast<int>(g_search_results.size())) return;
+    start_resolve(watch_url_for(g_search_results[static_cast<std::size_t>(index)]), index);
+}
+
+void apply_async_results() {
+    std::optional<std::vector<SearchTrack>> search_results;
+    std::optional<std::string> search_error;
+    std::optional<PendingResolve> resolved;
+    {
+        std::lock_guard lock(g_async_mutex);
+        if (g_pending_search_results) {
+            search_results = std::move(g_pending_search_results);
+            g_pending_search_results.reset();
+        }
+        if (g_pending_search_error) {
+            search_error = std::move(g_pending_search_error);
+            g_pending_search_error.reset();
+        }
+        if (g_pending_resolve) {
+            resolved = std::move(g_pending_resolve);
+            g_pending_resolve.reset();
+        }
+    }
+
+    if (search_results) {
+        g_search_results = std::move(*search_results);
+        g_current_index = -1;
+        g_status = g_search_results.empty() ? "No songs found" :
+                   std::to_string(g_search_results.size()) + " songs found";
+    }
+    if (search_error) {
+        g_search_error = *search_error;
+        if (!g_search_error.empty()) g_status = "Search failed";
+    }
+
+    if (resolved) {
+        if (resolved->result.ok) {
+            if (g_backend->play(resolved->result.track)) {
+                g_backend->set_volume(g_volume);
+                g_current_track = std::move(resolved->result.track);
+                g_current_index = resolved->search_index;
+                g_status = "Playing";
+            } else {
+                g_status = "Could not start mpv playback";
+            }
+        } else {
+            g_status = resolved->result.error.empty() ? "Could not resolve audio" :
+                       resolved->result.error;
+        }
+    }
+}
+
+PlaybackSnapshot playback_snapshot() {
+    std::lock_guard lock(g_playback_mutex);
+    return g_playback;
+}
+
+void start_playback_poller() {
+    g_poll_thread = std::jthread([](std::stop_token stop_token) {
+        while (!stop_token.stop_requested()) {
+            if (g_backend != nullptr) {
+                const PlaybackSnapshot snapshot = g_backend->snapshot();
+                {
+                    std::lock_guard lock(g_playback_mutex);
+                    g_playback = snapshot;
+                }
+            }
+            for (int i = 0; i < 5 && !stop_token.stop_requested(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+    });
+}
+
+void text_muted(const char* text) {
+    ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+    ImGui::TextUnformatted(text);
+    ImGui::PopStyleColor();
+}
+
+void spinner(const char* label) {
+    const int dots = static_cast<int>(ImGui::GetTime() * 2.8) % 4;
+    std::string value(label);
+    value.append(static_cast<std::size_t>(dots), '.');
+    text_muted(value.c_str());
+}
+
+void section_heading(const char* text) {
+    if (g_font_heading) ImGui::PushFont(g_font_heading);
+    ImGui::TextUnformatted(text);
+    if (g_font_heading) ImGui::PopFont();
+}
+
+void draw_album_placeholder(float size) {
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##album-art", ImVec2(size, size));
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImU32 bg = ImGui::ColorConvertFloat4ToU32(ImVec4(0.12f, 0.15f, 0.19f, 1.0f));
+    const ImU32 accent = ImGui::ColorConvertFloat4ToU32(kAccent);
+    draw->AddRectFilled(pos, ImVec2(pos.x + size, pos.y + size), bg, 24.0f);
+
+    const ImVec2 center(pos.x + size * 0.50f, pos.y + size * 0.51f);
+    const float radius = size * 0.19f;
+    draw->AddCircle(center, radius, accent, 48, 5.0f);
+    draw->AddCircleFilled(ImVec2(center.x - radius * 0.48f, center.y + radius * 0.48f),
+                          radius * 0.20f, accent, 24);
+    draw->AddLine(ImVec2(center.x - radius * 0.29f, center.y + radius * 0.43f),
+                  ImVec2(center.x - radius * 0.29f, center.y - radius * 0.62f), accent, 5.0f);
+    draw->AddLine(ImVec2(center.x - radius * 0.29f, center.y - radius * 0.62f),
+                  ImVec2(center.x + radius * 0.50f, center.y - radius * 0.42f), accent, 5.0f);
+}
+
+enum class TransportIcon { Previous, Play, Pause, Stop, Next };
+
+bool transport_button(const char* id, TransportIcon icon, float diameter, bool accent) {
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton(id, ImVec2(diameter, diameter));
+    const bool hovered = ImGui::IsItemHovered();
+    const bool held = ImGui::IsItemActive();
+
+    ImVec4 base = accent ? kAccent : ImVec4(0.14f, 0.15f, 0.19f, 1.0f);
+    if (hovered) base = accent ? kAccentHover : ImVec4(0.20f, 0.21f, 0.26f, 1.0f);
+    if (held) base = ImVec4(base.x * 0.88f, base.y * 0.88f, base.z * 0.88f, base.w);
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 center(pos.x + diameter * 0.5f, pos.y + diameter * 0.5f);
+    draw->AddCircleFilled(center, diameter * 0.5f, ImGui::ColorConvertFloat4ToU32(base), 40);
+
+    const ImU32 fg = ImGui::ColorConvertFloat4ToU32(
+        accent ? ImVec4(0.04f, 0.06f, 0.05f, 1.0f) : ImVec4(0.94f, 0.95f, 0.98f, 1.0f));
+    const float r = diameter * 0.19f;
+
+    if (icon == TransportIcon::Play) {
+        draw->AddTriangleFilled(ImVec2(center.x - r * 0.55f, center.y - r),
+                                ImVec2(center.x - r * 0.55f, center.y + r),
+                                ImVec2(center.x + r, center.y), fg);
+    } else if (icon == TransportIcon::Pause) {
+        const float w = r * 0.48f;
+        draw->AddRectFilled(ImVec2(center.x - r * 0.78f, center.y - r),
+                            ImVec2(center.x - r * 0.78f + w, center.y + r), fg, 2.0f);
+        draw->AddRectFilled(ImVec2(center.x + r * 0.28f, center.y - r),
+                            ImVec2(center.x + r * 0.28f + w, center.y + r), fg, 2.0f);
+    } else if (icon == TransportIcon::Stop) {
+        draw->AddRectFilled(ImVec2(center.x - r * 0.75f, center.y - r * 0.75f),
+                            ImVec2(center.x + r * 0.75f, center.y + r * 0.75f), fg, 2.0f);
+    } else {
+        const bool previous = icon == TransportIcon::Previous;
+        const float sign = previous ? -1.0f : 1.0f;
+        const float line_x = center.x + sign * (-r * 0.92f);
+        draw->AddLine(ImVec2(line_x, center.y - r), ImVec2(line_x, center.y + r), fg, 2.6f);
+        if (previous) {
+            draw->AddTriangleFilled(ImVec2(center.x + r * 0.62f, center.y - r),
+                                    ImVec2(center.x + r * 0.62f, center.y + r),
+                                    ImVec2(center.x - r * 0.62f, center.y), fg);
+        } else {
+            draw->AddTriangleFilled(ImVec2(center.x - r * 0.62f, center.y - r),
+                                    ImVec2(center.x - r * 0.62f, center.y + r),
+                                    ImVec2(center.x + r * 0.62f, center.y), fg);
+        }
+    }
+    return clicked;
+}
+
+void quality_combo() {
+    static const char* labels[] = {"Best", "High", "Balanced", "Data saver"};
+    ImGui::SetNextItemWidth(150.0f);
+    ImGui::Combo("##quality", &g_quality_index, labels, static_cast<int>(std::size(labels)));
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Audio quality used when the next song is resolved");
+    }
+}
+
+void render_search_panel(float width, float height) {
+    ImGui::BeginChild("SearchPanel", ImVec2(width, height), ImGuiChildFlags_Borders);
+
+    section_heading("Discover");
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 176.0f);
+    quality_combo();
+
+    const bool direct = input_is_direct_target();
+    ImGui::SetNextItemWidth(-112.0f);
+    const bool enter = ImGui::InputTextWithHint(
+        "##search", "Search song, artist, album or paste a YouTube URL...",
+        g_search_buffer.data(), g_search_buffer.size(), ImGuiInputTextFlags_EnterReturnsTrue);
+    if (g_focus_search) {
+        ImGui::SetKeyboardFocusHere(-1);
+        g_focus_search = false;
+    }
+    ImGui::SameLine();
+
+    ImGui::PushStyleColor(ImGuiCol_Button, kAccent);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kAccentHover);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.04f, 0.06f, 0.05f, 1.0f));
+    const bool action = ImGui::Button(direct ? "Play URL" : "Search", ImVec2(102.0f, 0.0f));
+    ImGui::PopStyleColor(3);
+
+    if (enter || action) {
+        const std::string input(g_search_buffer.data());
+        if (direct) start_resolve(input, -1);
+        else start_search(input);
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (g_search_busy) {
+        spinner("Searching");
+    } else if (!g_search_error.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.50f, 0.50f, 1.0f));
+        ImGui::TextWrapped("%s", g_search_error.c_str());
+        ImGui::PopStyleColor();
+    } else if (g_search_results.empty()) {
+        text_muted("Search results will appear here. Double-click a song or press Play.");
+    } else {
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 8.0f));
+        for (int i = 0; i < static_cast<int>(g_search_results.size()); ++i) {
+            const SearchTrack& track = g_search_results[static_cast<std::size_t>(i)];
+            ImGui::PushID(i);
+            const bool current = i == g_current_index;
+            ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                                  current ? ImVec4(0.12f, 0.19f, 0.16f, 1.0f) : kCard);
+            ImGui::BeginChild("track", ImVec2(0.0f, 88.0f), ImGuiChildFlags_Borders,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+            ImGui::SetCursorPos(ImVec2(14.0f, 12.0f));
+            const ImVec2 art_pos = ImGui::GetCursorScreenPos();
+            ImGui::Dummy(ImVec2(62.0f, 62.0f));
+            ImDrawList* draw = ImGui::GetWindowDrawList();
+            draw->AddRectFilled(art_pos, ImVec2(art_pos.x + 62.0f, art_pos.y + 62.0f),
+                                ImGui::ColorConvertFloat4ToU32(ImVec4(0.15f, 0.17f, 0.21f, 1.0f)), 10.0f);
+            draw->AddCircleFilled(ImVec2(art_pos.x + 31.0f, art_pos.y + 31.0f), 12.0f,
+                                  ImGui::ColorConvertFloat4ToU32(kAccent), 24);
+
+            ImGui::SameLine(88.0f);
+            ImGui::BeginGroup();
+            ImGui::PushTextWrapPos(ImGui::GetWindowWidth() - 100.0f);
+            ImGui::TextUnformatted(track.title.c_str());
+            ImGui::PopTextWrapPos();
+            if (g_font_small) ImGui::PushFont(g_font_small);
+            ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+            const std::string meta = track.channel + "  •  " + pcyoutube::music::format_time(track.duration);
+            ImGui::TextUnformatted(meta.c_str());
+            ImGui::PopStyleColor();
+            if (g_font_small) ImGui::PopFont();
+            ImGui::EndGroup();
+
+            ImGui::SameLine(ImGui::GetWindowWidth() - 82.0f);
+            ImGui::SetCursorPosY(27.0f);
+            if (ImGui::Button("Play", ImVec2(58.0f, 34.0f))) start_track_index(i);
+
+            if (ImGui::IsWindowHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                start_track_index(i);
+            }
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+            ImGui::PopID();
+        }
+        ImGui::PopStyleVar();
+    }
+
+    ImGui::EndChild();
+}
+
+std::string format_audio_meta(const TrackInfo& track) {
+    std::string value;
+    if (!track.extension.empty()) value += track.extension;
+    if (!track.codec.empty()) {
+        if (!value.empty()) value += "  •  ";
+        value += track.codec;
+    }
+    if (track.abr_kbps > 0.0) {
+        if (!value.empty()) value += "  •  ";
+        value += std::to_string(static_cast<int>(std::round(track.abr_kbps))) + " kbps";
+    }
+    if (track.sample_rate_hz > 0.0) {
+        if (!value.empty()) value += "  •  ";
+        value += std::to_string(static_cast<int>(std::round(track.sample_rate_hz / 1000.0))) + " kHz";
+    }
+    return value.empty() ? "Audio stream" : value;
+}
+
+void render_now_playing(float width, float height) {
+    ImGui::BeginChild("NowPlaying", ImVec2(width, height), ImGuiChildFlags_Borders);
+    section_heading("Now Playing");
+    ImGui::Spacing();
+
+    const float cover = std::clamp(ImGui::GetContentRegionAvail().x * 0.58f, 170.0f, 270.0f);
+    const float center_x = (ImGui::GetContentRegionAvail().x - cover) * 0.5f;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + center_x);
+    draw_album_placeholder(cover);
+    ImGui::Spacing();
+
+    if (!g_current_track) {
+        if (g_font_heading) ImGui::PushFont(g_font_heading);
+        ImGui::TextWrapped("Choose a song to start listening");
+        if (g_font_heading) ImGui::PopFont();
+        text_muted("Search YouTube on the left, then play any result.");
+    } else {
+        const TrackInfo& track = *g_current_track;
+        if (g_font_heading) ImGui::PushFont(g_font_heading);
+        ImGui::TextWrapped("%s", track.title.c_str());
+        if (g_font_heading) ImGui::PopFont();
+        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+        ImGui::TextWrapped("%s", track.channel.c_str());
+        ImGui::PopStyleColor();
+
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.18f, 0.15f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, kAccent);
+        const std::string quality = std::string(pcyoutube::music::quality_label(track.requested_quality));
+        ImGui::Button(quality.c_str());
+        ImGui::PopStyleColor(2);
+        ImGui::SameLine();
+        const std::string audio_meta = format_audio_meta(track);
+        text_muted(audio_meta.c_str());
+
+        if (track.duration > 0.0) {
+            const std::string duration = "Duration  " + pcyoutube::music::format_time(track.duration);
+            text_muted(duration.c_str());
+        }
+
+        ImGui::Spacing();
+        if (ImGui::CollapsingHeader("Track details")) {
+            if (!track.id.empty()) ImGui::Text("Video ID: %s", track.id.c_str());
+            if (!track.format_id.empty()) ImGui::Text("Format: %s", track.format_id.c_str());
+            ImGui::TextWrapped("Source: %s", track.webpage_url.c_str());
+            ImGui::Spacing();
+            ImGui::TextUnformatted("Direct audio URL");
+            ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+            ImGui::TextWrapped("%s", track.direct_url.c_str());
+            ImGui::PopStyleColor();
+            if (ImGui::Button("Copy direct URL")) {
+                ImGui::SetClipboardText(track.direct_url.c_str());
+                g_status = "Direct audio URL copied";
+            }
+        }
+    }
+
+    if (g_resolve_busy) {
+        ImGui::Spacing();
+        spinner("Preparing audio");
+    }
+
+    ImGui::EndChild();
+}
+
+void render_player_bar(float height) {
+    ImGui::BeginChild("PlayerBar", ImVec2(0.0f, height), ImGuiChildFlags_Borders);
+    const PlaybackSnapshot snapshot = playback_snapshot();
+
+    const double duration = snapshot.duration > 0.0 ? snapshot.duration :
+                            (g_current_track ? g_current_track->duration : 0.0);
+    const float max_value = static_cast<float>(std::max(0.001, duration));
+    if (!g_seek_dragging) g_seek_value = static_cast<float>(snapshot.position);
+
+    const std::string left_time = pcyoutube::music::format_time(g_seek_dragging ? g_seek_value : snapshot.position);
+    const std::string right_time = pcyoutube::music::format_time(duration);
+    if (g_font_small) ImGui::PushFont(g_font_small);
+    ImGui::TextUnformatted(left_time.c_str());
+    ImGui::SameLine();
+    const float time_width = ImGui::CalcTextSize(right_time.c_str()).x;
+    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - time_width - 18.0f);
+    ImGui::TextUnformatted(right_time.c_str());
+    if (g_font_small) ImGui::PopFont();
+
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, 10.0f);
+    ImGui::SliderFloat("##progress", &g_seek_value, 0.0f, max_value, "", ImGuiSliderFlags_NoInput);
+    if (ImGui::IsItemActivated()) g_seek_dragging = true;
+    if (g_seek_dragging && ImGui::IsItemDeactivatedAfterEdit()) {
+        if (g_backend != nullptr) g_backend->seek(g_seek_value);
+        g_seek_dragging = false;
+    }
+    ImGui::PopStyleVar();
+
+    const float controls_y = ImGui::GetCursorPosY() + 2.0f;
+    ImGui::SetCursorPosY(controls_y);
+
+    const float center_width = 48.0f + 14.0f + 58.0f + 14.0f + 48.0f + 14.0f + 42.0f;
+    ImGui::SetCursorPosX((ImGui::GetWindowWidth() - center_width) * 0.5f);
+
+    const bool has_prev = g_current_index > 0;
+    const bool has_next = g_current_index >= 0 && g_current_index + 1 < static_cast<int>(g_search_results.size());
+
+    ImGui::BeginDisabled(!has_prev || g_resolve_busy);
+    if (transport_button("##prev", TransportIcon::Previous, 42.0f, false) && has_prev) {
+        start_track_index(g_current_index - 1);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine(0.0f, 14.0f);
+
+    const TransportIcon play_icon = snapshot.running && !snapshot.paused ?
+                                    TransportIcon::Pause : TransportIcon::Play;
+    if (transport_button("##playpause", play_icon, 58.0f, true)) {
+        if (g_backend != nullptr) {
+            if (snapshot.running) {
+                g_backend->toggle_pause();
+            } else if (g_current_track) {
+                g_backend->play(*g_current_track);
+            } else if (!g_search_results.empty()) {
+                start_track_index(0);
+            }
+        }
+    }
+    ImGui::SameLine(0.0f, 14.0f);
+
+    ImGui::BeginDisabled(!has_next || g_resolve_busy);
+    if (transport_button("##next", TransportIcon::Next, 42.0f, false) && has_next) {
+        start_track_index(g_current_index + 1);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine(0.0f, 14.0f);
+
+    if (transport_button("##stop", TransportIcon::Stop, 42.0f, false)) {
+        if (g_backend != nullptr) g_backend->stop();
+    }
+
+    const float volume_width = 180.0f;
+    ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - volume_width - 18.0f, controls_y + 8.0f));
+    if (g_font_small) ImGui::PushFont(g_font_small);
+    ImGui::TextUnformatted("VOL");
+    if (g_font_small) ImGui::PopFont();
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(volume_width - 54.0f);
+    int volume = g_volume;
+    if (ImGui::SliderInt("##volume", &volume, 0, 100, "%d")) {
+        g_volume = volume;
+        if (g_backend != nullptr) g_backend->set_volume(g_volume);
+    }
+
+    ImGui::SetCursorPos(ImVec2(18.0f, controls_y + 11.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+    if (g_font_small) ImGui::PushFont(g_font_small);
+    ImGui::TextUnformatted(g_status.c_str());
+    if (g_font_small) ImGui::PopFont();
+    ImGui::PopStyleColor();
+
+    ImGui::EndChild();
+}
+
+void render_app() {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->WorkPos);
+    ImGui::SetNextWindowSize(viewport->WorkSize);
+    ImGui::SetNextWindowViewport(viewport->ID);
+
+    constexpr ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18.0f, 14.0f));
+    ImGui::Begin("PcYoutubeRoot", nullptr, flags);
+
+    if (g_font_display) ImGui::PushFont(g_font_display);
+    ImGui::TextUnformatted("PcYoutube Music");
+    if (g_font_display) ImGui::PopFont();
+    ImGui::SameLine();
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 10.0f);
+    text_muted("direct audio player");
+
+    ImGui::Spacing();
+
+    const float player_height = 132.0f;
+    const float content_height = std::max(260.0f, ImGui::GetContentRegionAvail().y - player_height - 10.0f);
+    const float available_width = ImGui::GetContentRegionAvail().x;
+    const float left_width = std::max(480.0f, available_width * 0.61f);
+    const float right_width = std::max(340.0f, available_width - left_width - 10.0f);
+
+    render_search_panel(left_width, content_height);
+    ImGui::SameLine();
+    render_now_playing(right_width, content_height);
+
+    ImGui::Spacing();
+    render_player_bar(player_height);
+
+    ImGui::End();
+    ImGui::PopStyleVar();
 }
 
 }  // namespace
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
-    if (std::wstring_view(GetCommandLineW()).find(L"--self-test") != std::wstring_view::npos) {
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    if (std::wcsstr(GetCommandLineW(), L"--self-test") != nullptr) {
         return pcyoutube::music::self_test() ? 0 : 1;
     }
 
-    INITCOMMONCONTROLSEX common_controls{};
-    common_controls.dwSize = sizeof(common_controls);
-    common_controls.dwICC = ICC_BAR_CLASSES;
-    InitCommonControlsEx(&common_controls);
-
-    g_exe_dir = executable_directory();
-    g_yt_dlp_path = g_exe_dir / L"tools" / L"yt-dlp.exe";
-    g_mpv_path = g_exe_dir / L"tools" / L"mpv" / L"mpv.exe";
-
-    const auto app_text = pcyoutube::music::app_text();
-    const std::wstring title = utf8_to_wide(app_text.title);
-    constexpr wchar_t kWindowClass[] = L"PcYoutubeAudioWindow";
-
-    WNDCLASSW window_class{};
+    WNDCLASSEXW window_class{};
+    window_class.cbSize = sizeof(window_class);
+    window_class.style = CS_CLASSDC;
     window_class.lpfnWndProc = window_proc;
     window_class.hInstance = instance;
-    window_class.lpszClassName = kWindowClass;
+    window_class.lpszClassName = L"PcYoutubeMusicImGui";
     window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+    RegisterClassExW(&window_class);
 
-    if (RegisterClassW(&window_class) == 0) {
+    HWND window = CreateWindowW(
+        window_class.lpszClassName, L"PcYoutube Music",
+        WS_OVERLAPPEDWINDOW, 100, 80, 1240, 820,
+        nullptr, nullptr, window_class.hInstance, nullptr);
+    if (window == nullptr) {
+        UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
         return 2;
     }
 
-    HWND window = CreateWindowExW(
-        0,
-        kWindowClass,
-        title.c_str(),
-        WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        860,
-        300,
-        nullptr,
-        nullptr,
-        instance,
-        nullptr);
-
-    if (window == nullptr) {
+    apply_dark_title_bar(window);
+    if (!create_device_d3d(window)) {
+        cleanup_device_d3d();
+        DestroyWindow(window);
+        UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
         return 3;
     }
+    create_render_target();
 
-    ShowWindow(window, show_command);
+    ShowWindow(window, SW_SHOWDEFAULT);
     UpdateWindow(window);
 
-    MSG message{};
-    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    io.IniFilename = nullptr;
+
+    configure_style();
+    load_fonts();
+    ImGui_ImplWin32_Init(window);
+    ImGui_ImplDX11_Init(g_device, g_device_context);
+
+    AudioBackend backend;
+    g_backend = &backend;
+    if (!backend.ready()) {
+        g_status = backend.readiness_error();
+    }
+    start_playback_poller();
+
+    bool done = false;
+    while (!done) {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0U, 0U, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+            if (message.message == WM_QUIT) done = true;
+        }
+        if (done) break;
+
+        if (g_resize_width != 0 && g_resize_height != 0) {
+            cleanup_render_target();
+            g_swap_chain->ResizeBuffers(0, g_resize_width, g_resize_height,
+                                        DXGI_FORMAT_UNKNOWN, 0);
+            g_resize_width = g_resize_height = 0;
+            create_render_target();
+        }
+
+        apply_async_results();
+
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+        render_app();
+        ImGui::Render();
+
+        const float clear_color[4] = {0.045f, 0.049f, 0.064f, 1.0f};
+        g_device_context->OMSetRenderTargets(1, &g_main_render_target, nullptr);
+        g_device_context->ClearRenderTargetView(g_main_render_target, clear_color);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        g_swap_chain->Present(1, 0);
     }
 
-    return static_cast<int>(message.wParam);
+    if (g_poll_thread.joinable()) {
+        g_poll_thread.request_stop();
+        g_poll_thread.join();
+    }
+    if (g_search_thread.joinable()) g_search_thread.join();
+    if (g_resolve_thread.joinable()) g_resolve_thread.join();
+
+    backend.shutdown();
+    g_backend = nullptr;
+
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+
+    cleanup_device_d3d();
+    DestroyWindow(window);
+    UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
+    return 0;
 }
