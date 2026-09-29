@@ -16,7 +16,7 @@ namespace {
 
 constexpr int kSearchEditId = 1001;
 constexpr int kGoButtonId = 1002;
-constexpr int kBackButtonId = 1003;
+constexpr int kHomeButtonId = 1003;
 constexpr int kStatusTextId = 1004;
 constexpr int kTopBarHeight = 58;
 constexpr int kBottomStatusHeight = 28;
@@ -24,7 +24,7 @@ constexpr int kBottomStatusHeight = 28;
 HWND g_main_window = nullptr;
 HWND g_search_edit = nullptr;
 HWND g_go_button = nullptr;
-HWND g_back_button = nullptr;
+HWND g_home_button = nullptr;
 HWND g_status_text = nullptr;
 ComPtr<ICoreWebView2Controller> g_webview_controller;
 ComPtr<ICoreWebView2> g_webview;
@@ -92,7 +92,8 @@ std::string wide_to_utf8(std::wstring_view text) {
 
 void set_status(std::wstring_view text) {
     if (g_status_text != nullptr) {
-        SetWindowTextW(g_status_text, std::wstring(text).c_str());
+        const std::wstring copy(text);
+        SetWindowTextW(g_status_text, copy.c_str());
     }
 }
 
@@ -102,8 +103,12 @@ std::wstring read_edit_text(HWND edit) {
         return {};
     }
 
-    std::wstring text(static_cast<std::size_t>(length), L'\0');
-    GetWindowTextW(edit, text.data(), length + 1);
+    std::wstring text(static_cast<std::size_t>(length) + 1U, L'\0');
+    const int copied = GetWindowTextW(edit, text.data(), length + 1);
+    if (copied <= 0) {
+        return {};
+    }
+    text.resize(static_cast<std::size_t>(copied));
     return text;
 }
 
@@ -117,30 +122,48 @@ void layout_children() {
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
 
-    const int margin = 12;
-    const int button_width = 92;
-    const int back_width = 82;
-    const int control_height = 32;
-    const int controls_y = 12;
+    constexpr int margin = 12;
+    constexpr int button_width = 96;
+    constexpr int home_width = 76;
+    constexpr int control_height = 32;
+    constexpr int controls_y = 12;
 
     if (g_search_edit != nullptr) {
-        const int edit_width = (width - margin * 4 - button_width - back_width);
-        MoveWindow(g_search_edit, margin, controls_y, edit_width > 180 ? edit_width : 180, control_height, TRUE);
+        int edit_width = width - margin * 4 - button_width - home_width;
+        if (edit_width < 180) {
+            edit_width = 180;
+        }
+        MoveWindow(g_search_edit, margin, controls_y, edit_width, control_height, TRUE);
     }
 
     if (g_go_button != nullptr) {
-        MoveWindow(g_go_button, width - margin * 2 - back_width - button_width, controls_y,
-                   button_width, control_height, TRUE);
+        MoveWindow(
+            g_go_button,
+            width - margin * 2 - home_width - button_width,
+            controls_y,
+            button_width,
+            control_height,
+            TRUE);
     }
 
-    if (g_back_button != nullptr) {
-        MoveWindow(g_back_button, width - margin - back_width, controls_y,
-                   back_width, control_height, TRUE);
+    if (g_home_button != nullptr) {
+        MoveWindow(
+            g_home_button,
+            width - margin - home_width,
+            controls_y,
+            home_width,
+            control_height,
+            TRUE);
     }
 
     if (g_status_text != nullptr) {
-        MoveWindow(g_status_text, margin, height - kBottomStatusHeight,
-                   width - margin * 2, 20, TRUE);
+        MoveWindow(
+            g_status_text,
+            margin,
+            height - kBottomStatusHeight,
+            width - margin * 2,
+            20,
+            TRUE);
     }
 
     if (g_webview_controller) {
@@ -162,25 +185,22 @@ void navigate_to_input() {
         return;
     }
 
-    const std::wstring input_wide = read_edit_text(g_search_edit);
-    const std::string input = wide_to_utf8(input_wide);
+    const std::string input = wide_to_utf8(read_edit_text(g_search_edit));
     if (input.empty()) {
         set_status(L"Type a song/artist name or paste a YouTube link.");
         return;
     }
 
     if (const auto video_id = pcyoutube::music::extract_video_id(input)) {
-        const std::string url = pcyoutube::music::make_embed_url(*video_id);
-        const std::wstring wide_url = utf8_to_wide(url);
-        g_webview->Navigate(wide_url.c_str());
+        const std::wstring url = utf8_to_wide(pcyoutube::music::make_embed_url(*video_id));
+        g_webview->Navigate(url.c_str());
         set_status(L"Playing with the official visible YouTube embedded player.");
         return;
     }
 
-    const std::string url = pcyoutube::music::make_search_url(input);
-    const std::wstring wide_url = utf8_to_wide(url);
-    g_webview->Navigate(wide_url.c_str());
-    set_status(L"Search results from YouTube. Select a video to play it inside PcYoutube Music.");
+    const std::wstring url = utf8_to_wide(pcyoutube::music::make_search_url(input));
+    g_webview->Navigate(url.c_str());
+    set_status(L"YouTube search results. Select a video to play it inside PcYoutube Music.");
 }
 
 void navigate_home() {
@@ -215,7 +235,8 @@ HRESULT initialize_webview() {
                             }
 
                             g_webview_controller = controller;
-                            const HRESULT webview_result = controller->get_CoreWebView2(g_webview.GetAddressOf());
+                            const HRESULT webview_result =
+                                controller->get_CoreWebView2(g_webview.GetAddressOf());
                             if (FAILED(webview_result) || !g_webview) {
                                 set_status(L"Could not initialize WebView2.");
                                 return webview_result;
@@ -226,7 +247,6 @@ HRESULT initialize_webview() {
                                 settings->put_AreDefaultContextMenusEnabled(TRUE);
                                 settings->put_AreDevToolsEnabled(FALSE);
                                 settings->put_IsStatusBarEnabled(FALSE);
-                                settings->put_AreBrowserAcceleratorKeysEnabled(TRUE);
                             }
 
                             g_webview->add_NavigationStarting(
@@ -250,16 +270,17 @@ HRESULT initialize_webview() {
                                             return S_OK;
                                         }
 
-                                        const auto video_id = pcyoutube::music::extract_video_id(wide_to_utf8(uri));
+                                        const auto video_id = pcyoutube::music::extract_video_id(
+                                            wide_to_utf8(uri));
                                         if (!video_id) {
                                             return S_OK;
                                         }
 
-                                        const std::wstring embed_url =
-                                            utf8_to_wide(pcyoutube::music::make_embed_url(*video_id));
+                                        const std::wstring embed_url = utf8_to_wide(
+                                            pcyoutube::music::make_embed_url(*video_id));
                                         args->put_Cancel(TRUE);
                                         sender->Navigate(embed_url.c_str());
-                                        set_status(L"Now playing. The YouTube player stays visible by design.");
+                                        set_status(L"Now playing. The YouTube player remains visible.");
                                         return S_OK;
                                     })
                                     .Get(),
@@ -285,7 +306,7 @@ strong{color:#fff}
 <main>
 <h1>PcYoutube Music</h1>
 <p>Search above for a song, artist, album, or paste a YouTube URL.</p>
-<p><strong>Music-first UI:</strong> PcYoutube uses the official YouTube embedded player for playback; it does not extract or download a separate audio stream.</p>
+<p><strong>Music-first UI:</strong> playback uses the official YouTube embedded player. PcYoutube does not extract or download a separate audio stream.</p>
 </main>
 </body>
 </html>)HTML";
@@ -302,7 +323,6 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
     switch (message) {
     case WM_CREATE: {
         g_main_window = hwnd;
-
         HFONT gui_font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
 
         g_search_edit = CreateWindowExW(
@@ -333,7 +353,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
             nullptr,
             nullptr);
 
-        g_back_button = CreateWindowExW(
+        g_home_button = CreateWindowExW(
             0,
             L"BUTTON",
             L"Music",
@@ -343,7 +363,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
             80,
             30,
             hwnd,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kBackButtonId)),
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kHomeButtonId)),
             nullptr,
             nullptr);
 
@@ -363,11 +383,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
 
         SendMessageW(g_search_edit, WM_SETFONT, reinterpret_cast<WPARAM>(gui_font), TRUE);
         SendMessageW(g_go_button, WM_SETFONT, reinterpret_cast<WPARAM>(gui_font), TRUE);
-        SendMessageW(g_back_button, WM_SETFONT, reinterpret_cast<WPARAM>(gui_font), TRUE);
+        SendMessageW(g_home_button, WM_SETFONT, reinterpret_cast<WPARAM>(gui_font), TRUE);
         SendMessageW(g_status_text, WM_SETFONT, reinterpret_cast<WPARAM>(gui_font), TRUE);
-
-        SendMessageW(g_search_edit, EM_SETCUEBANNER, TRUE,
-                     reinterpret_cast<LPARAM>(L"Song, artist, or YouTube URL"));
 
         layout_children();
         const HRESULT result = initialize_webview();
@@ -386,18 +403,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
             navigate_to_input();
             return 0;
         }
-        if (LOWORD(w_param) == kBackButtonId && HIWORD(w_param) == BN_CLICKED) {
+        if (LOWORD(w_param) == kHomeButtonId && HIWORD(w_param) == BN_CLICKED) {
             navigate_home();
-            return 0;
-        }
-        if (LOWORD(w_param) == kSearchEditId && HIWORD(w_param) == EN_UPDATE) {
-            return 0;
-        }
-        break;
-
-    case WM_KEYDOWN:
-        if (w_param == VK_RETURN && GetFocus() == g_search_edit) {
-            navigate_to_input();
             return 0;
         }
         break;
