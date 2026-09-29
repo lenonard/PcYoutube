@@ -1,5 +1,7 @@
 # PcYoutube Music
 
+Current prototype: **v0.2**.
+
 PcYoutube Music is a lightweight native C++ desktop application with a music-first interface for browsing and playing YouTube content.
 
 ## Playback model
