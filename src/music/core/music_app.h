@@ -14,8 +14,8 @@ struct AppText {
 AppText app_text();
 
 std::optional<std::string> extract_video_id(std::string_view input);
-std::string make_embed_url(std::string_view video_id);
-std::string make_search_url(std::string_view query);
+std::string make_yt_dlp_target(std::string_view input);
+bool looks_like_http_url(std::string_view input);
 
 bool self_test();
 
