@@ -25,3 +25,7 @@ A non-interactive smoke test is also available:
 - `.github/workflows/windows-cmake.yml` - Windows/MSVC CI build and artifact upload.
 
 The current GUI intentionally avoids heavyweight frameworks and external runtime dependencies. An Android frontend can later link the same `pcyoutube_core` target from an NDK build.
+
+## CI
+
+Every push to `main` builds the Windows x64 Release target, runs CTest plus the native `--self-test`, and uploads the `out/` package as a GitHub Actions artifact.
