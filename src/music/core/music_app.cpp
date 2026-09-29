@@ -52,7 +52,7 @@ std::optional<std::string> read_id_after(std::string_view value, std::string_vie
 AppText app_text() {
     return {
         "PcYoutube Music",
-        "Fast native YouTube audio search, direct-stream playback and a modern music-player interface."
+        "Fast native YouTube audio search, direct-stream playback and persistent playlists."
     };
 }
 
@@ -111,11 +111,11 @@ std::string make_search_target(std::string_view query, int max_results) {
 
 std::string_view quality_label(AudioQuality quality) noexcept {
     switch (quality) {
-    case AudioQuality::Best: return "Best available";
-    case AudioQuality::High: return "High";
-    case AudioQuality::Balanced: return "Balanced";
+    case AudioQuality::Best: return "Best source";
+    case AudioQuality::High: return "Prefer Opus";
+    case AudioQuality::Balanced: return "Prefer AAC / M4A";
     case AudioQuality::DataSaver: return "Data saver";
-    default: return "Best available";
+    default: return "Best source";
     }
 }
 
@@ -124,11 +124,11 @@ std::string_view quality_selector(AudioQuality quality) noexcept {
     case AudioQuality::Best:
         return "bestaudio";
     case AudioQuality::High:
-        return "bestaudio[abr>=160]/bestaudio[ext=m4a]/bestaudio";
+        return "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio";
     case AudioQuality::Balanced:
-        return "bestaudio[abr<=128]/bestaudio[ext=m4a]/bestaudio";
+        return "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio";
     case AudioQuality::DataSaver:
-        return "worstaudio";
+        return "bestaudio[abr<=64]/worstaudio";
     default:
         return "bestaudio";
     }
@@ -166,7 +166,9 @@ bool self_test() {
            make_yt_dlp_target("M7lc1UVf-VE") ==
                "https://www.youtube.com/watch?v=M7lc1UVf-VE" &&
            make_search_target("lofi hip hop", 12) == "ytsearch12:lofi hip hop" &&
-           quality_selector(AudioQuality::DataSaver) == "worstaudio" &&
+           quality_label(AudioQuality::High) == "Prefer Opus" &&
+           quality_selector(AudioQuality::Balanced).find("m4a") != std::string_view::npos &&
+           quality_selector(AudioQuality::DataSaver).find("abr<=64") != std::string_view::npos &&
            format_time(125.0) == "2:05";
 }
 
