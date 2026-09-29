@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <iomanip>
+#include <sstream>
 
 namespace pcyoutube::music {
 namespace {
@@ -48,8 +51,8 @@ std::optional<std::string> read_id_after(std::string_view value, std::string_vie
 
 AppText app_text() {
     return {
-        "PcYoutube Audio",
-        "Resolve YouTube audio directly with yt-dlp and play it through an audio-only mpv engine."
+        "PcYoutube Music",
+        "Fast native YouTube audio search, direct-stream playback and a modern music-player interface."
     };
 }
 
@@ -94,7 +97,60 @@ std::string make_yt_dlp_target(std::string_view input) {
         return value;
     }
 
-    return "ytsearch1:" + value;
+    return make_search_target(value, 1);
+}
+
+std::string make_search_target(std::string_view query, int max_results) {
+    const std::string value = trim(query);
+    if (value.empty()) {
+        return {};
+    }
+    max_results = std::clamp(max_results, 1, 50);
+    return "ytsearch" + std::to_string(max_results) + ":" + value;
+}
+
+std::string_view quality_label(AudioQuality quality) noexcept {
+    switch (quality) {
+    case AudioQuality::Best: return "Best available";
+    case AudioQuality::High: return "High";
+    case AudioQuality::Balanced: return "Balanced";
+    case AudioQuality::DataSaver: return "Data saver";
+    default: return "Best available";
+    }
+}
+
+std::string_view quality_selector(AudioQuality quality) noexcept {
+    switch (quality) {
+    case AudioQuality::Best:
+        return "bestaudio";
+    case AudioQuality::High:
+        return "bestaudio[abr>=160]/bestaudio[ext=m4a]/bestaudio";
+    case AudioQuality::Balanced:
+        return "bestaudio[abr<=128]/bestaudio[ext=m4a]/bestaudio";
+    case AudioQuality::DataSaver:
+        return "worstaudio";
+    default:
+        return "bestaudio";
+    }
+}
+
+std::string format_time(double seconds) {
+    if (!std::isfinite(seconds) || seconds < 0.0) {
+        seconds = 0.0;
+    }
+    const int total = static_cast<int>(std::llround(seconds));
+    const int hours = total / 3600;
+    const int minutes = (total % 3600) / 60;
+    const int secs = total % 60;
+
+    std::ostringstream out;
+    if (hours > 0) {
+        out << hours << ':' << std::setfill('0') << std::setw(2) << minutes << ':'
+            << std::setw(2) << secs;
+    } else {
+        out << minutes << ':' << std::setfill('0') << std::setw(2) << secs;
+    }
+    return out.str();
 }
 
 bool self_test() {
@@ -109,8 +165,9 @@ bool self_test() {
            !invalid &&
            make_yt_dlp_target("M7lc1UVf-VE") ==
                "https://www.youtube.com/watch?v=M7lc1UVf-VE" &&
-           make_yt_dlp_target("lofi hip hop") == "ytsearch1:lofi hip hop" &&
-           make_yt_dlp_target("https://example.com/audio") == "https://example.com/audio";
+           make_search_target("lofi hip hop", 12) == "ytsearch12:lofi hip hop" &&
+           quality_selector(AudioQuality::DataSaver) == "worstaudio" &&
+           format_time(125.0) == "2:05";
 }
 
 }  // namespace pcyoutube::music
