@@ -99,7 +99,7 @@ jobs:
           if ($process.ExitCode -ne 0) {
             throw "PcYoutube self-test failed with exit code $($process.ExitCode)"
           }
-          Write-Host "PcYoutube v0.3 core self-test passed."
+          Write-Host "PcYoutube v0.4 core self-test passed."
 
       - name: Bundle yt-dlp and mpv audio engine
         shell: pwsh
@@ -159,7 +159,7 @@ jobs:
       - name: Upload Windows x64 package
         uses: actions/upload-artifact@v4
         with:
-          name: PcYoutube-audio-v0.3-windows-x64
+          name: PcYoutube-Music-v0.4-windows-x64
           path: artifact/
           if-no-files-found: error
           retention-days: 7
