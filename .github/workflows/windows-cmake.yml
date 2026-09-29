@@ -1,0 +1,108 @@
+name: PcYoutube Windows Native / CMake
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build-and-test:
+    name: MSVC / Windows 10 target
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Verify tools and install only if missing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not (Get-Command cmake.exe -ErrorAction SilentlyContinue)) {
+            choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y --no-progress
+            $env:Path += ";C:\Program Files\CMake\bin;C:\ProgramData\chocolatey\bin"
+          }
+
+          if (-not (Get-Command ninja.exe -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+            $env:Path += ";C:\ProgramData\chocolatey\bin"
+          }
+
+          if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+            throw "MSVC cl.exe was not found after enabling the Visual Studio developer environment."
+          }
+
+          cmake --version
+          ninja --version
+          Write-Host "MSVC: $((Get-Command cl.exe).Source)"
+
+      - name: Restore CMake build cache
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: ${{ runner.os }}-x64-msvc-pcyoutube-${{ hashFiles('CMakeLists.txt', 'src/**') }}
+          restore-keys: |
+            ${{ runner.os }}-x64-msvc-pcyoutube-
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G Ninja `
+            "-DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}" `
+            "-DCMAKE_SYSTEM_VERSION=10.0"
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Verify output
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD "out\PcYoutube.exe"
+          if (-not (Test-Path $exe)) {
+            throw "Executable not found: $exe"
+          }
+          Get-Item $exe | Format-List FullName, Length, LastWriteTime
+
+      - name: Run CTest
+        shell: pwsh
+        run: ctest --test-dir build --build-config ${{ env.BUILD_TYPE }} --output-on-failure
+
+      - name: Run native self-test
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD "out\PcYoutube.exe"
+          $process = Start-Process -FilePath $exe -ArgumentList "--self-test" -PassThru -Wait
+          if ($process.ExitCode -ne 0) {
+            throw "PcYoutube self-test failed with exit code $($process.ExitCode)"
+          }
+          Write-Host "PcYoutube native hello-world self-test passed."
+
+      - name: Stage artifact preserving out folder
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force artifact -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path artifact | Out-Null
+          Copy-Item -Recurse -Force out artifact\out
+
+      - name: Upload Windows x64 package
+        uses: actions/upload-artifact@v4
+        with:
+          name: PcYoutube-out-windows-x64
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
