@@ -1,25 +1,65 @@
-# PcYoutube Music
+# PcYoutube Audio
 
-Current prototype: **v0.2**.
+Current prototype: **v0.3**.
 
-PcYoutube Music is a lightweight native C++ desktop application with a music-first interface for browsing and playing YouTube content.
+PcYoutube Audio is a lightweight native C++ Windows player that does **not** use WebView. It resolves an audio-only media URL with `yt-dlp` and sends that direct URL to an `mpv` process running with video disabled.
 
-## Playback model
+## Playback flow
 
-YouTube playback is handled through the official visible embedded player inside Microsoft Edge WebView2. The application does not extract, download, or separately decode YouTube audio streams.
+```text
+YouTube URL / video ID / search text
+        |
+        v
+      yt-dlp
+  bestaudio[ext=m4a]/bestaudio
+        |
+        +--> title
+        +--> direct media URL
+                  |
+                  v
+             mpv --no-video
+                  |
+                  v
+              speakers
+```
 
-You can:
+The resolved media URL is displayed in the UI and can be copied to the clipboard. `Resolve + Play` always performs a fresh resolve because YouTube media URLs are temporary and normally expire.
 
-- search YouTube by song, artist, album, or other keywords;
-- paste a YouTube video URL or 11-character video ID;
-- select a search result and play it inside the app;
-- use the normal YouTube playback controls in the embedded player.
+For plain text input such as `Adele Hello`, PcYoutube uses `ytsearch1:Adele Hello` and resolves the first search result. A normal YouTube URL or 11-character video ID is also accepted.
 
-Some videos may refuse embedded playback according to the uploader's YouTube settings.
+## Player controls
+
+- **Resolve + Play** - obtain a fresh audio URL and play it.
+- **Pause / Resume** - toggle mpv pause state through its local named-pipe IPC interface.
+- **Stop** - stop the current stream.
+- **Volume** - native Windows slider controlling mpv volume.
+- **Copy URL** - copy the currently resolved direct audio URL.
+
+There is no browser surface, HTML rendering, YouTube video UI, or WebView dependency in v0.3.
+
+## Runtime tools
+
+The Windows package contains:
+
+```text
+out/
+├─ PcYoutube.exe
+├─ README.md
+├─ THIRD_PARTY.md
+└─ tools/
+   ├─ yt-dlp.exe
+   └─ mpv/
+      └─ mpv.exe
+```
+
+The CI package currently pins:
+
+- yt-dlp `2026.08.19`
+- zhongfly mpv Windows build `2026-09-29-b4b5d69a44`
+
+See `THIRD_PARTY.md` for upstream/source and license information.
 
 ## Architecture
-
-The application logic is separated from its platform frontend:
 
 ```text
 src/music/
@@ -31,33 +71,27 @@ src/music/
       └─ main_win32.cpp
 ```
 
-`pcyoutube_core` contains platform-independent C++ code for YouTube video-ID parsing and URL construction. The Windows frontend is native Win32 plus WebView2.
-
-This layout intentionally leaves the core reusable for a future Android frontend. An Android/NDK version can link the same core and provide an Android WebView-based platform layer.
-
-## Windows requirements
-
-- Windows 10 or Windows 11 x64
-- Microsoft Edge WebView2 Runtime
-
-Modern Windows installations commonly already include the WebView2 Runtime. If it is missing, the application reports that requirement in its status area.
+`pcyoutube_core` handles input normalization independently of the Windows UI. The Windows frontend handles process execution, yt-dlp output parsing, mpv IPC, clipboard operations, and native controls.
 
 ## Windows build
 
-Using an MSVC developer environment with CMake and Ninja:
+The C++ executable itself only needs MSVC, CMake, and Ninja:
 
 ```powershell
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
-.\out\PcYoutube.exe
-```
-
-Run the non-interactive core smoke test with:
-
-```powershell
 .\out\PcYoutube.exe --self-test
 ```
 
+For normal playback, put `yt-dlp.exe` at `out\tools\yt-dlp.exe` and `mpv.exe` at `out\tools\mpv\mpv.exe`. GitHub Actions does this automatically for release artifacts.
+
+## Notes
+
+- Direct media URLs are temporary. Resolve again when one expires.
+- Extraction can stop working when YouTube changes its delivery logic; updating yt-dlp is usually the first fix.
+- Some videos may require authentication, region access, age verification, or other account/session context that this prototype does not import automatically.
+- Use the application only with media you are permitted to access. This is an unofficial client and direct media extraction can be restricted by YouTube's terms or by content rights.
+
 ## CI
 
-`.github/workflows/windows-cmake.yml` builds Windows x64 Release on every push to `main`, verifies `out/PcYoutube.exe`, runs CTest and the native self-test, then uploads `out/` as the `PcYoutube-out-windows-x64` artifact.
+`.github/workflows/windows-cmake.yml` builds Windows x64 Release, runs CTest and the native self-test, downloads the pinned yt-dlp and mpv binaries from their upstream GitHub releases, and uploads the complete `out/` directory as `PcYoutube-audio-v0.3-windows-x64`.
