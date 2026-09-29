@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(PcYoutube VERSION 0.4.0 LANGUAGES CXX)
+project(PcYoutube VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -59,10 +59,31 @@ if(WIN32)
         WIN32_LEAN_AND_MEAN
     )
 
+    find_program(PCYOUTUBE_POWERSHELL NAMES powershell.exe powershell REQUIRED)
+    set(PCYOUTUBE_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated")
+    file(MAKE_DIRECTORY "${PCYOUTUBE_GENERATED_DIR}")
+    set(PCYOUTUBE_APP_ICON "${PCYOUTUBE_GENERATED_DIR}/PcYoutube.ico")
+    set(APP_ICON_RESOURCE_PATH "${PCYOUTUBE_APP_ICON}")
+    set(PCYOUTUBE_APP_RC "${PCYOUTUBE_GENERATED_DIR}/PcYoutube.rc")
+    configure_file(cmake/app.rc.in "${PCYOUTUBE_APP_RC}" @ONLY)
+
+    add_custom_command(
+        OUTPUT "${PCYOUTUBE_APP_ICON}"
+        COMMAND "${PCYOUTUBE_POWERSHELL}" -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_SOURCE_DIR}/cmake/generate_app_icon.ps1"
+                -Output "${PCYOUTUBE_APP_ICON}"
+        DEPENDS cmake/generate_app_icon.ps1
+        VERBATIM
+    )
+    add_custom_target(pcyoutube_app_icon DEPENDS "${PCYOUTUBE_APP_ICON}")
+
     add_executable(PcYoutube WIN32
         src/music/platform/windows/main_win32.cpp
         src/music/platform/windows/audio_backend.cpp
+        src/music/platform/windows/playlist_store.cpp
+        "${PCYOUTUBE_APP_RC}"
     )
+    add_dependencies(PcYoutube pcyoutube_app_icon)
 
     target_include_directories(PcYoutube PRIVATE
         src/music/platform/windows
