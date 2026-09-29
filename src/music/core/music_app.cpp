@@ -2,8 +2,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <iomanip>
-#include <sstream>
 
 namespace pcyoutube::music {
 namespace {
@@ -46,30 +44,18 @@ std::optional<std::string> read_id_after(std::string_view value, std::string_vie
     return is_valid_video_id(candidate) ? std::optional<std::string>(candidate) : std::nullopt;
 }
 
-std::string url_encode(std::string_view value) {
-    std::ostringstream out;
-    out << std::uppercase << std::hex;
-
-    for (const unsigned char ch : value) {
-        if (std::isalnum(ch) != 0 || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
-            out << static_cast<char>(ch);
-        } else if (ch == ' ') {
-            out << '+';
-        } else {
-            out << '%' << std::setw(2) << std::setfill('0') << static_cast<int>(ch);
-        }
-    }
-
-    return out.str();
-}
-
 }  // namespace
 
 AppText app_text() {
     return {
-        "PcYoutube Music",
-        "Search YouTube, choose a track, and listen in a music-first native desktop shell."
+        "PcYoutube Audio",
+        "Resolve YouTube audio directly with yt-dlp and play it through an audio-only mpv engine."
     };
+}
+
+bool looks_like_http_url(std::string_view input) {
+    const std::string value = trim(input);
+    return value.starts_with("https://") || value.starts_with("http://");
 }
 
 std::optional<std::string> extract_video_id(std::string_view input) {
@@ -94,21 +80,21 @@ std::optional<std::string> extract_video_id(std::string_view input) {
     return std::nullopt;
 }
 
-std::string make_embed_url(std::string_view video_id) {
-    if (!is_valid_video_id(video_id)) {
+std::string make_yt_dlp_target(std::string_view input) {
+    const std::string value = trim(input);
+    if (value.empty()) {
         return {};
     }
 
-    return "https://www.youtube.com/embed/" + std::string(video_id) +
-           "?autoplay=1&controls=1&playsinline=1&rel=0";
-}
-
-std::string make_search_url(std::string_view query) {
-    const std::string cleaned = trim(query);
-    if (cleaned.empty()) {
-        return "https://www.youtube.com/";
+    if (const auto id = extract_video_id(value)) {
+        return "https://www.youtube.com/watch?v=" + *id;
     }
-    return "https://www.youtube.com/results?search_query=" + url_encode(cleaned);
+
+    if (looks_like_http_url(value)) {
+        return value;
+    }
+
+    return "ytsearch1:" + value;
 }
 
 bool self_test() {
@@ -121,8 +107,10 @@ bool self_test() {
            watch && *watch == "M7lc1UVf-VE" &&
            short_url && *short_url == "M7lc1UVf-VE" &&
            !invalid &&
-           make_embed_url("M7lc1UVf-VE").find("youtube.com/embed/M7lc1UVf-VE") != std::string::npos &&
-           make_search_url("lofi hip hop").find("lofi+hip+hop") != std::string::npos;
+           make_yt_dlp_target("M7lc1UVf-VE") ==
+               "https://www.youtube.com/watch?v=M7lc1UVf-VE" &&
+           make_yt_dlp_target("lofi hip hop") == "ytsearch1:lofi hip hop" &&
+           make_yt_dlp_target("https://example.com/audio") == "https://example.com/audio";
 }
 
 }  // namespace pcyoutube::music
