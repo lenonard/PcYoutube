@@ -118,6 +118,9 @@ jobs:
           $mpvArchivePath = Join-Path $env:RUNNER_TEMP "pcyoutube-mpv.7z"
           Invoke-WebRequest -Uri $mpvUrl -OutFile $mpvArchivePath
           & 7z.exe x $mpvArchivePath "-o$mpvDir" -y | Out-Host
+          if ($LASTEXITCODE -ne 0) {
+            throw "7-Zip failed to extract mpv with exit code $LASTEXITCODE."
+          }
 
           $mpvExe = Get-ChildItem -Path $mpvDir -Filter mpv.exe -Recurse | Select-Object -First 1
           if (-not $mpvExe) {
@@ -137,7 +140,11 @@ jobs:
           }
 
           & $ytDlpPath --version
-          & $expectedMpv --version | Select-Object -First 4
+          if ($LASTEXITCODE -ne 0) {
+            throw "yt-dlp version check failed."
+          }
+          Get-Item $expectedMpv | Format-List FullName, Length, LastWriteTime
+          Get-FileHash $expectedMpv -Algorithm SHA256 | Format-List
 
           Copy-Item README.md out\README.md -Force
           Copy-Item THIRD_PARTY.md out\THIRD_PARTY.md -Force
