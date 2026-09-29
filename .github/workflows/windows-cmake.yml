@@ -12,6 +12,9 @@ permissions:
 
 env:
   BUILD_TYPE: Release
+  YTDLP_VERSION: "2026.08.19"
+  MPV_TAG: "2026-09-29-b4b5d69a44"
+  MPV_ARCHIVE: "mpv-x86_64-20260929-git-b4b5d69a44.7z"
 
 jobs:
   build-and-test:
@@ -42,12 +45,18 @@ jobs:
             $env:Path += ";C:\ProgramData\chocolatey\bin"
           }
 
+          if (-not (Get-Command 7z.exe -ErrorAction SilentlyContinue)) {
+            choco install 7zip.commandline -y --no-progress
+            $env:Path += ";C:\ProgramData\chocolatey\bin"
+          }
+
           if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
             throw "MSVC cl.exe was not found after enabling the Visual Studio developer environment."
           }
 
           cmake --version
           ninja --version
+          7z | Select-Object -First 2
           Write-Host "MSVC: $((Get-Command cl.exe).Source)"
 
       - name: Restore CMake build cache
@@ -90,7 +99,48 @@ jobs:
           if ($process.ExitCode -ne 0) {
             throw "PcYoutube self-test failed with exit code $($process.ExitCode)"
           }
-          Write-Host "PcYoutube native hello-world self-test passed."
+          Write-Host "PcYoutube v0.3 core self-test passed."
+
+      - name: Bundle yt-dlp and mpv audio engine
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tools = Join-Path $PWD "out\tools"
+          $mpvDir = Join-Path $tools "mpv"
+          New-Item -ItemType Directory -Force -Path $tools | Out-Null
+          New-Item -ItemType Directory -Force -Path $mpvDir | Out-Null
+
+          $ytDlpUrl = "https://github.com/yt-dlp/yt-dlp/releases/download/${{ env.YTDLP_VERSION }}/yt-dlp.exe"
+          $ytDlpPath = Join-Path $tools "yt-dlp.exe"
+          Invoke-WebRequest -Uri $ytDlpUrl -OutFile $ytDlpPath
+
+          $mpvUrl = "https://github.com/zhongfly/mpv-winbuild/releases/download/${{ env.MPV_TAG }}/${{ env.MPV_ARCHIVE }}"
+          $mpvArchivePath = Join-Path $env:RUNNER_TEMP "pcyoutube-mpv.7z"
+          Invoke-WebRequest -Uri $mpvUrl -OutFile $mpvArchivePath
+          & 7z.exe x $mpvArchivePath "-o$mpvDir" -y | Out-Host
+
+          $mpvExe = Get-ChildItem -Path $mpvDir -Filter mpv.exe -Recurse | Select-Object -First 1
+          if (-not $mpvExe) {
+            throw "mpv.exe was not found after extracting the archive."
+          }
+
+          $expectedMpv = Join-Path $mpvDir "mpv.exe"
+          if ($mpvExe.FullName -ne $expectedMpv) {
+            Copy-Item -Path (Join-Path $mpvExe.DirectoryName "*") -Destination $mpvDir -Recurse -Force
+          }
+
+          if (-not (Test-Path $ytDlpPath)) {
+            throw "yt-dlp.exe missing from packaged tools."
+          }
+          if (-not (Test-Path $expectedMpv)) {
+            throw "mpv.exe missing from packaged tools."
+          }
+
+          & $ytDlpPath --version
+          & $expectedMpv --version | Select-Object -First 4
+
+          Copy-Item README.md out\README.md -Force
+          Copy-Item THIRD_PARTY.md out\THIRD_PARTY.md -Force
 
       - name: Stage artifact preserving out folder
         shell: pwsh
@@ -102,7 +152,7 @@ jobs:
       - name: Upload Windows x64 package
         uses: actions/upload-artifact@v4
         with:
-          name: PcYoutube-out-windows-x64
+          name: PcYoutube-audio-v0.3-windows-x64
           path: artifact/
           if-no-files-found: error
           retention-days: 7
