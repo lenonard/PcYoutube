@@ -160,8 +160,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Deno version check failed." }
           Get-Item $expectedMpv | Format-List FullName, Length, LastWriteTime
 
-          # Exercise the exact YouTube extraction path used by Play. Search alone is not enough:
-          # full format extraction now needs a supported JavaScript runtime.
+          # Exercise the same full extraction path used by Play. GitHub-hosted runner IPs can
+          # occasionally receive YouTube's anti-bot challenge. That is a network/account gate,
+          # not a broken bundled runtime, so report it as inconclusive rather than failing the build.
           $smokeVideo = "https://www.youtube.com/watch?v=M7lc1UVf-VE"
           $smokeOutput = & $ytDlpPath `
             --no-config --no-playlist --no-warnings --no-progress `
@@ -169,14 +170,20 @@ jobs:
             --simulate --format "bestaudio" --print "%(url)s" $smokeVideo 2>&1
           $smokeExit = $LASTEXITCODE
           $smokeOutput | Out-Host
-          if ($smokeExit -ne 0) {
-            throw "YouTube resolve smoke test failed with exit code $smokeExit."
+          $smokeText = ($smokeOutput | Out-String)
+
+          if ($smokeExit -eq 0) {
+            $directUrl = $smokeOutput | Where-Object { "$_" -match '^https?://' } | Select-Object -First 1
+            if (-not $directUrl) {
+              throw "YouTube resolve smoke test exited successfully but returned no direct media URL."
+            }
+            Write-Host "YouTube resolve smoke test PASS: direct media URL received."
+          } elseif ($smokeText -match "Sign in to confirm you.*not a bot" -or
+                    $smokeText -match "confirm you.*not a bot") {
+            Write-Warning "YouTube challenged the GitHub runner IP. yt-dlp, Deno and mpv packaging checks passed; live YouTube resolve is inconclusive on this CI host."
+          } else {
+            throw "YouTube resolve smoke test failed with exit code $smokeExit for a reason other than the known CI bot challenge."
           }
-          $directUrl = $smokeOutput | Where-Object { "$_" -match '^https?://' } | Select-Object -First 1
-          if (-not $directUrl) {
-            throw "YouTube resolve smoke test returned no direct media URL."
-          }
-          Write-Host "YouTube resolve smoke test PASS: direct media URL received."
 
           Copy-Item README.md out\README.md -Force
           Copy-Item THIRD_PARTY.md out\THIRD_PARTY.md -Force
