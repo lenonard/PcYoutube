@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -81,6 +82,8 @@ private:
     bool start_mpv();
     bool send_command(std::string_view json_command, std::string* response = nullptr);
     bool configure_http_headers(const TrackInfo& track);
+    void cancel_playback_watch();
+    void arm_playback_fallback(const TrackInfo& track);
     std::optional<double> query_number(std::string_view property);
     std::optional<bool> query_bool(std::string_view property);
 
@@ -93,6 +96,7 @@ private:
     int volume_ = 75;
     std::string last_error_;
     std::mutex mpv_mutex_;
+    std::jthread playback_watch_thread_;
 };
 
 }  // namespace pcyoutube::windows
