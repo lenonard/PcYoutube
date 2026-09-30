@@ -67,6 +67,7 @@ PlaylistStore::PlaylistStore() : storage_path_(default_storage_path()) {}
 bool PlaylistStore::load(std::string* error) {
     if (error != nullptr) error->clear();
     playlists_.clear();
+    settings_ = AppSettings{};
 
     std::error_code fs_error;
     if (!std::filesystem::exists(storage_path_, fs_error)) {
@@ -82,6 +83,16 @@ bool PlaylistStore::load(std::string* error) {
 
         json root;
         input >> root;
+
+        const auto settings_it = root.find("settings");
+        if (settings_it != root.end() && settings_it->is_object()) {
+            settings_.volume = std::clamp(settings_it->value("volume", 75), 0, 100);
+            settings_.quality_index = std::clamp(settings_it->value("quality_index", 0), 0, 3);
+            settings_.selected_playlist = settings_it->value("selected_playlist", -1);
+            settings_.shuffle = settings_it->value("shuffle", false);
+            settings_.repeat_mode = std::clamp(settings_it->value("repeat_mode", 0), 0, 2);
+        }
+
         const auto it = root.find("playlists");
         if (it == root.end() || !it->is_array()) {
             return true;
@@ -104,6 +115,13 @@ bool PlaylistStore::load(std::string* error) {
             }
             playlists_.push_back(std::move(playlist));
         }
+
+        if (playlists_.empty()) {
+            settings_.selected_playlist = -1;
+        } else {
+            settings_.selected_playlist = std::clamp(
+                settings_.selected_playlist, 0, static_cast<int>(playlists_.size()) - 1);
+        }
         return true;
     } catch (const std::exception& exception) {
         if (error != nullptr) {
@@ -124,7 +142,14 @@ bool PlaylistStore::save(std::string* error) const {
         }
 
         json root;
-        root["version"] = 1;
+        root["version"] = 2;
+        root["settings"] = {
+            {"volume", std::clamp(settings_.volume, 0, 100)},
+            {"quality_index", std::clamp(settings_.quality_index, 0, 3)},
+            {"selected_playlist", settings_.selected_playlist},
+            {"shuffle", settings_.shuffle},
+            {"repeat_mode", std::clamp(settings_.repeat_mode, 0, 2)},
+        };
         root["playlists"] = json::array();
         for (const Playlist& playlist : playlists_) {
             json item;
@@ -177,8 +202,10 @@ int PlaylistStore::create(std::string_view name, std::string* error) {
     }
 
     playlists_.push_back(Playlist{cleaned, {}});
+    settings_.selected_playlist = static_cast<int>(playlists_.size() - 1U);
     if (!save(error)) {
         playlists_.pop_back();
+        settings_.selected_playlist = playlists_.empty() ? -1 : 0;
         return -1;
     }
     return static_cast<int>(playlists_.size() - 1U);
@@ -188,9 +215,16 @@ bool PlaylistStore::remove(std::size_t playlist_index, std::string* error) {
     if (error != nullptr) error->clear();
     if (playlist_index >= playlists_.size()) return false;
     const Playlist backup = playlists_[playlist_index];
+    const AppSettings old_settings = settings_;
     playlists_.erase(playlists_.begin() + static_cast<std::ptrdiff_t>(playlist_index));
+    if (playlists_.empty()) {
+        settings_.selected_playlist = -1;
+    } else if (settings_.selected_playlist >= static_cast<int>(playlists_.size())) {
+        settings_.selected_playlist = static_cast<int>(playlists_.size()) - 1;
+    }
     if (!save(error)) {
         playlists_.insert(playlists_.begin() + static_cast<std::ptrdiff_t>(playlist_index), backup);
+        settings_ = old_settings;
         return false;
     }
     return true;
@@ -225,6 +259,25 @@ bool PlaylistStore::remove_track(std::size_t playlist_index, std::size_t track_i
     tracks.erase(tracks.begin() + static_cast<std::ptrdiff_t>(track_index));
     if (!save(error)) {
         tracks.insert(tracks.begin() + static_cast<std::ptrdiff_t>(track_index), backup);
+        return false;
+    }
+    return true;
+}
+
+bool PlaylistStore::move_track(std::size_t playlist_index, std::size_t from_index,
+                               std::size_t to_index, std::string* error) {
+    if (error != nullptr) error->clear();
+    if (playlist_index >= playlists_.size()) return false;
+    auto& tracks = playlists_[playlist_index].tracks;
+    if (from_index >= tracks.size() || to_index >= tracks.size()) return false;
+    if (from_index == to_index) return true;
+
+    const auto backup = tracks;
+    SearchTrack moving = std::move(tracks[from_index]);
+    tracks.erase(tracks.begin() + static_cast<std::ptrdiff_t>(from_index));
+    tracks.insert(tracks.begin() + static_cast<std::ptrdiff_t>(to_index), std::move(moving));
+    if (!save(error)) {
+        tracks = backup;
         return false;
     }
     return true;

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(PcYoutube VERSION 0.5.0 LANGUAGES CXX)
+project(PcYoutube VERSION 0.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -81,6 +81,7 @@ if(WIN32)
         src/music/platform/windows/main_win32.cpp
         src/music/platform/windows/audio_backend.cpp
         src/music/platform/windows/playlist_store.cpp
+        src/music/platform/windows/thumbnail_cache.cpp
         "${PCYOUTUBE_APP_RC}"
     )
     add_dependencies(PcYoutube pcyoutube_app_icon)
@@ -99,6 +100,9 @@ if(WIN32)
         user32
         gdi32
         shell32
+        winhttp
+        windowscodecs
+        ole32
     )
 
     target_compile_definitions(PcYoutube PRIVATE
