@@ -63,7 +63,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build
-          key: ${{ runner.os }}-x64-msvc-pcyoutube-${{ hashFiles('CMakeLists.txt', 'src/**') }}
+          key: ${{ runner.os }}-x64-msvc-pcyoutube-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'src/**') }}
           restore-keys: |
             ${{ runner.os }}-x64-msvc-pcyoutube-
 
@@ -78,7 +78,7 @@ jobs:
         shell: pwsh
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
 
-      - name: Verify output
+      - name: Verify output and version metadata
         shell: pwsh
         run: |
           $exe = Join-Path $PWD "out\PcYoutube.exe"
@@ -86,6 +86,7 @@ jobs:
             throw "Executable not found: $exe"
           }
           Get-Item $exe | Format-List FullName, Length, LastWriteTime
+          (Get-Item $exe).VersionInfo | Format-List ProductName, ProductVersion, FileDescription, FileVersion
 
       - name: Run CTest
         shell: pwsh
@@ -99,7 +100,7 @@ jobs:
           if ($process.ExitCode -ne 0) {
             throw "PcYoutube self-test failed with exit code $($process.ExitCode)"
           }
-          Write-Host "PcYoutube v0.4 core self-test passed."
+          Write-Host "PcYoutube v0.5 core self-test passed."
 
       - name: Bundle yt-dlp and mpv audio engine
         shell: pwsh
@@ -144,10 +145,21 @@ jobs:
             throw "yt-dlp version check failed."
           }
           Get-Item $expectedMpv | Format-List FullName, Length, LastWriteTime
-          Get-FileHash $expectedMpv -Algorithm SHA256 | Format-List
 
           Copy-Item README.md out\README.md -Force
           Copy-Item THIRD_PARTY.md out\THIRD_PARTY.md -Force
+
+          $hashLines = @()
+          foreach ($item in @(
+              @{ Path = "out\PcYoutube.exe"; Name = "PcYoutube.exe" },
+              @{ Path = "out\tools\yt-dlp.exe"; Name = "tools/yt-dlp.exe" },
+              @{ Path = "out\tools\mpv\mpv.exe"; Name = "tools/mpv/mpv.exe" }
+          )) {
+              $hash = (Get-FileHash $item.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+              $hashLines += "$hash  $($item.Name)"
+          }
+          Set-Content -Path out\SHA256SUMS.txt -Value $hashLines -Encoding ascii
+          Get-Content out\SHA256SUMS.txt
 
       - name: Stage artifact preserving out folder
         shell: pwsh
@@ -159,7 +171,7 @@ jobs:
       - name: Upload Windows x64 package
         uses: actions/upload-artifact@v4
         with:
-          name: PcYoutube-Music-v0.4-windows-x64
+          name: PcYoutube-Music-v0.5-windows-x64
           path: artifact/
           if-no-files-found: error
           retention-days: 7
