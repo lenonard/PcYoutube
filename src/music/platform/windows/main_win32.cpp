@@ -20,6 +20,7 @@
 
 #include "audio_backend.h"
 #include "music_app.h"
+#include "playlist_store.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -33,8 +34,12 @@ using pcyoutube::music::AudioQuality;
 using pcyoutube::windows::AudioBackend;
 using pcyoutube::windows::BackendResult;
 using pcyoutube::windows::PlaybackSnapshot;
+using pcyoutube::windows::Playlist;
+using pcyoutube::windows::PlaylistStore;
 using pcyoutube::windows::SearchTrack;
 using pcyoutube::windows::TrackInfo;
+
+constexpr int kAppIconResourceId = 101;
 
 ID3D11Device* g_device = nullptr;
 ID3D11DeviceContext* g_device_context = nullptr;
@@ -44,6 +49,7 @@ UINT g_resize_width = 0;
 UINT g_resize_height = 0;
 
 AudioBackend* g_backend = nullptr;
+PlaylistStore* g_playlist_store = nullptr;
 std::jthread g_search_thread;
 std::jthread g_resolve_thread;
 std::jthread g_poll_thread;
@@ -54,9 +60,17 @@ std::mutex g_async_mutex;
 std::optional<std::vector<SearchTrack>> g_pending_search_results;
 std::optional<std::string> g_pending_search_error;
 
+enum class ResolveSource {
+    Direct,
+    Search,
+    Playlist,
+};
+
 struct PendingResolve {
     BackendResult result;
-    int search_index = -1;
+    ResolveSource source = ResolveSource::Direct;
+    int item_index = -1;
+    int playlist_index = -1;
 };
 std::optional<PendingResolve> g_pending_resolve;
 
@@ -68,12 +82,20 @@ std::optional<TrackInfo> g_current_track;
 std::string g_search_error;
 std::string g_status = "Ready";
 int g_current_index = -1;
+int g_current_playlist = -1;
+int g_current_playlist_track = -1;
+ResolveSource g_queue_source = ResolveSource::Direct;
+int g_selected_playlist = -1;
 int g_quality_index = 0;
 int g_volume = 75;
 std::array<char, 1024> g_search_buffer{};
+std::array<char, 160> g_playlist_name_buffer{};
 bool g_focus_search = true;
 bool g_seek_dragging = false;
 float g_seek_value = 0.0f;
+
+std::optional<SearchTrack> g_add_to_playlist_track;
+bool g_request_add_popup = false;
 
 ImFont* g_font_body = nullptr;
 ImFont* g_font_small = nullptr;
@@ -246,6 +268,17 @@ std::string watch_url_for(const SearchTrack& track) {
            "https://www.youtube.com/watch?v=" + track.id;
 }
 
+SearchTrack search_track_from_current() {
+    SearchTrack track;
+    if (!g_current_track) return track;
+    track.id = g_current_track->id;
+    track.title = g_current_track->title;
+    track.channel = g_current_track->channel;
+    track.thumbnail_url = g_current_track->thumbnail_url;
+    track.duration = g_current_track->duration;
+    return track;
+}
+
 bool input_is_direct_target() {
     const std::string input(g_search_buffer.data());
     return pcyoutube::music::looks_like_http_url(input) ||
@@ -275,7 +308,7 @@ void start_search(std::string query) {
     });
 }
 
-void start_resolve(std::string target, int search_index) {
+void start_resolve(std::string target, ResolveSource source, int item_index, int playlist_index = -1) {
     if (g_backend == nullptr || g_resolve_busy.exchange(true)) return;
     if (target.empty()) {
         g_resolve_busy = false;
@@ -286,11 +319,12 @@ void start_resolve(std::string target, int search_index) {
     const AudioQuality quality = selected_quality();
     g_status = "Resolving direct audio stream...";
 
-    g_resolve_thread = std::jthread([target = std::move(target), search_index, quality] {
+    g_resolve_thread = std::jthread([
+        target = std::move(target), source, item_index, playlist_index, quality] {
         BackendResult result = g_backend->resolve(target, quality);
         {
             std::lock_guard lock(g_async_mutex);
-            g_pending_resolve = PendingResolve{std::move(result), search_index};
+            g_pending_resolve = PendingResolve{std::move(result), source, item_index, playlist_index};
         }
         g_resolve_busy = false;
     });
@@ -298,7 +332,18 @@ void start_resolve(std::string target, int search_index) {
 
 void start_track_index(int index) {
     if (index < 0 || index >= static_cast<int>(g_search_results.size())) return;
-    start_resolve(watch_url_for(g_search_results[static_cast<std::size_t>(index)]), index);
+    start_resolve(watch_url_for(g_search_results[static_cast<std::size_t>(index)]),
+                  ResolveSource::Search, index);
+}
+
+void start_playlist_track(int playlist_index, int track_index) {
+    if (g_playlist_store == nullptr) return;
+    const auto& playlists = g_playlist_store->playlists();
+    if (playlist_index < 0 || playlist_index >= static_cast<int>(playlists.size())) return;
+    const auto& tracks = playlists[static_cast<std::size_t>(playlist_index)].tracks;
+    if (track_index < 0 || track_index >= static_cast<int>(tracks.size())) return;
+    start_resolve(watch_url_for(tracks[static_cast<std::size_t>(track_index)]),
+                  ResolveSource::Playlist, track_index, playlist_index);
 }
 
 void apply_async_results() {
@@ -323,7 +368,6 @@ void apply_async_results() {
 
     if (search_results) {
         g_search_results = std::move(*search_results);
-        g_current_index = -1;
         g_status = g_search_results.empty() ? "No songs found" :
                    std::to_string(g_search_results.size()) + " songs found";
     }
@@ -337,7 +381,20 @@ void apply_async_results() {
             if (g_backend->play(resolved->result.track)) {
                 g_backend->set_volume(g_volume);
                 g_current_track = std::move(resolved->result.track);
-                g_current_index = resolved->search_index;
+                g_queue_source = resolved->source;
+                if (resolved->source == ResolveSource::Search) {
+                    g_current_index = resolved->item_index;
+                    g_current_playlist = -1;
+                    g_current_playlist_track = -1;
+                } else if (resolved->source == ResolveSource::Playlist) {
+                    g_current_index = -1;
+                    g_current_playlist = resolved->playlist_index;
+                    g_current_playlist_track = resolved->item_index;
+                } else {
+                    g_current_index = -1;
+                    g_current_playlist = -1;
+                    g_current_playlist_track = -1;
+                }
                 g_status = "Playing";
             } else {
                 g_status = "Could not start mpv playback";
@@ -461,22 +518,28 @@ bool transport_button(const char* id, TransportIcon icon, float diameter, bool a
 }
 
 void quality_combo() {
-    static const char* labels[] = {"Best", "High", "Balanced", "Data saver"};
-    ImGui::SetNextItemWidth(150.0f);
+    static const char* labels[] = {
+        "Best source",
+        "Prefer Opus",
+        "Prefer AAC / M4A",
+        "Data saver",
+    };
+    ImGui::SetNextItemWidth(178.0f);
     ImGui::Combo("##quality", &g_quality_index, labels, static_cast<int>(std::size(labels)));
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Audio quality used when the next song is resolved");
+        ImGui::SetTooltip(
+            "Direct source formats only. Actual bitrate depends on the YouTube source.\n"
+            "MP3 320 kbps would require transcoding and does not create extra source quality.");
     }
 }
 
-void render_search_panel(float width, float height) {
-    ImGui::BeginChild("SearchPanel", ImVec2(width, height), ImGuiChildFlags_Borders);
+void request_add_to_playlist(const SearchTrack& track) {
+    if (track.id.empty() || track.title.empty()) return;
+    g_add_to_playlist_track = track;
+    g_request_add_popup = true;
+}
 
-    section_heading("Discover");
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 176.0f);
-    quality_combo();
-
+void render_search_contents() {
     const bool direct = input_is_direct_target();
     ImGui::SetNextItemWidth(-112.0f);
     const bool enter = ImGui::InputTextWithHint(
@@ -496,7 +559,7 @@ void render_search_panel(float width, float height) {
 
     if (enter || action) {
         const std::string input(g_search_buffer.data());
-        if (direct) start_resolve(input, -1);
+        if (direct) start_resolve(input, ResolveSource::Direct, -1);
         else start_search(input);
     }
 
@@ -517,7 +580,7 @@ void render_search_panel(float width, float height) {
         for (int i = 0; i < static_cast<int>(g_search_results.size()); ++i) {
             const SearchTrack& track = g_search_results[static_cast<std::size_t>(i)];
             ImGui::PushID(i);
-            const bool current = i == g_current_index;
+            const bool current = g_queue_source == ResolveSource::Search && i == g_current_index;
             ImGui::PushStyleColor(ImGuiCol_ChildBg,
                                   current ? ImVec4(0.12f, 0.19f, 0.16f, 1.0f) : kCard);
             ImGui::BeginChild("track", ImVec2(0.0f, 88.0f), ImGuiChildFlags_Borders,
@@ -534,7 +597,7 @@ void render_search_panel(float width, float height) {
 
             ImGui::SameLine(88.0f);
             ImGui::BeginGroup();
-            ImGui::PushTextWrapPos(ImGui::GetWindowWidth() - 100.0f);
+            ImGui::PushTextWrapPos(ImGui::GetWindowWidth() - 176.0f);
             ImGui::TextUnformatted(track.title.c_str());
             ImGui::PopTextWrapPos();
             if (g_font_small) ImGui::PushFont(g_font_small);
@@ -545,8 +608,10 @@ void render_search_panel(float width, float height) {
             if (g_font_small) ImGui::PopFont();
             ImGui::EndGroup();
 
-            ImGui::SameLine(ImGui::GetWindowWidth() - 82.0f);
+            ImGui::SameLine(ImGui::GetWindowWidth() - 150.0f);
             ImGui::SetCursorPosY(27.0f);
+            if (ImGui::Button("Add", ImVec2(56.0f, 34.0f))) request_add_to_playlist(track);
+            ImGui::SameLine(0.0f, 6.0f);
             if (ImGui::Button("Play", ImVec2(58.0f, 34.0f))) start_track_index(i);
 
             if (ImGui::IsWindowHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
@@ -557,6 +622,179 @@ void render_search_panel(float width, float height) {
             ImGui::PopID();
         }
         ImGui::PopStyleVar();
+    }
+}
+
+void render_playlist_contents() {
+    if (g_playlist_store == nullptr) {
+        text_muted("Playlist storage is unavailable.");
+        return;
+    }
+
+    ImGui::SetNextItemWidth(-116.0f);
+    ImGui::InputTextWithHint("##playlist-name", "New playlist name...",
+                             g_playlist_name_buffer.data(), g_playlist_name_buffer.size());
+    ImGui::SameLine();
+    if (ImGui::Button("Create", ImVec2(106.0f, 0.0f))) {
+        std::string error;
+        const int created = g_playlist_store->create(g_playlist_name_buffer.data(), &error);
+        if (created >= 0) {
+            g_selected_playlist = created;
+            g_playlist_name_buffer.fill('\0');
+            g_status = "Playlist created";
+        } else if (!error.empty()) {
+            g_status = error;
+        }
+    }
+
+    auto& playlists = g_playlist_store->playlists();
+    if (playlists.empty()) {
+        ImGui::Spacing();
+        text_muted("Create a playlist, then use Add on any search result.");
+        return;
+    }
+
+    if (g_selected_playlist < 0 || g_selected_playlist >= static_cast<int>(playlists.size())) {
+        g_selected_playlist = 0;
+    }
+
+    ImGui::Spacing();
+    ImGui::SetNextItemWidth(-96.0f);
+    const char* preview = playlists[static_cast<std::size_t>(g_selected_playlist)].name.c_str();
+    if (ImGui::BeginCombo("##playlist-picker", preview)) {
+        for (int i = 0; i < static_cast<int>(playlists.size()); ++i) {
+            const bool selected = i == g_selected_playlist;
+            if (ImGui::Selectable(playlists[static_cast<std::size_t>(i)].name.c_str(), selected)) {
+                g_selected_playlist = i;
+            }
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Delete", ImVec2(86.0f, 0.0f))) {
+        const int removed = g_selected_playlist;
+        std::string error;
+        if (g_playlist_store->remove(static_cast<std::size_t>(removed), &error)) {
+            if (g_queue_source == ResolveSource::Playlist) {
+                if (g_current_playlist == removed) {
+                    g_queue_source = ResolveSource::Direct;
+                    g_current_playlist = -1;
+                    g_current_playlist_track = -1;
+                } else if (g_current_playlist > removed) {
+                    --g_current_playlist;
+                }
+            }
+            if (g_selected_playlist >= static_cast<int>(g_playlist_store->playlists().size())) {
+                g_selected_playlist = static_cast<int>(g_playlist_store->playlists().size()) - 1;
+            }
+            g_status = "Playlist deleted";
+        } else if (!error.empty()) {
+            g_status = error;
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (g_selected_playlist < 0 ||
+        g_selected_playlist >= static_cast<int>(g_playlist_store->playlists().size())) {
+        return;
+    }
+
+    const Playlist& playlist = g_playlist_store->playlists()[static_cast<std::size_t>(g_selected_playlist)];
+    if (playlist.tracks.empty()) {
+        text_muted("This playlist is empty. Add songs from Search or Now Playing.");
+        return;
+    }
+
+    for (int i = 0; i < static_cast<int>(playlist.tracks.size()); ++i) {
+        const SearchTrack track = playlist.tracks[static_cast<std::size_t>(i)];
+        ImGui::PushID(i);
+        const bool current = g_queue_source == ResolveSource::Playlist &&
+                             g_current_playlist == g_selected_playlist &&
+                             g_current_playlist_track == i;
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                              current ? ImVec4(0.12f, 0.19f, 0.16f, 1.0f) : kCard);
+        ImGui::BeginChild("playlist-track", ImVec2(0.0f, 78.0f), ImGuiChildFlags_Borders,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::SetCursorPos(ImVec2(14.0f, 12.0f));
+        ImGui::PushTextWrapPos(ImGui::GetWindowWidth() - 168.0f);
+        ImGui::TextUnformatted(track.title.c_str());
+        ImGui::PopTextWrapPos();
+        if (g_font_small) ImGui::PushFont(g_font_small);
+        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+        const std::string meta = track.channel + "  •  " + pcyoutube::music::format_time(track.duration);
+        ImGui::TextUnformatted(meta.c_str());
+        ImGui::PopStyleColor();
+        if (g_font_small) ImGui::PopFont();
+
+        ImGui::SameLine(ImGui::GetWindowWidth() - 144.0f);
+        ImGui::SetCursorPosY(22.0f);
+        if (ImGui::Button("Play", ImVec2(58.0f, 34.0f))) {
+            start_playlist_track(g_selected_playlist, i);
+        }
+        ImGui::SameLine(0.0f, 6.0f);
+        if (ImGui::Button("Remove", ImVec2(68.0f, 34.0f))) {
+            std::string error;
+            if (g_playlist_store->remove_track(static_cast<std::size_t>(g_selected_playlist),
+                                               static_cast<std::size_t>(i), &error)) {
+                if (g_queue_source == ResolveSource::Playlist &&
+                    g_current_playlist == g_selected_playlist) {
+                    if (g_current_playlist_track == i) {
+                        g_queue_source = ResolveSource::Direct;
+                        g_current_playlist_track = -1;
+                    } else if (g_current_playlist_track > i) {
+                        --g_current_playlist_track;
+                    }
+                }
+                g_status = "Removed from playlist";
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+                ImGui::PopID();
+                break;
+            }
+            if (!error.empty()) g_status = error;
+        }
+
+        if (ImGui::IsWindowHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            start_playlist_track(g_selected_playlist, i);
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::PopID();
+    }
+}
+
+void render_library_panel(float width, float height) {
+    ImGui::BeginChild("LibraryPanel", ImVec2(width, height), ImGuiChildFlags_Borders);
+
+    section_heading("Library");
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 204.0f);
+    quality_combo();
+    if (g_font_small) ImGui::PushFont(g_font_small);
+    ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+    ImGui::TextUnformatted("Direct source stream • bitrate shown after resolve");
+    ImGui::PopStyleColor();
+    if (g_font_small) ImGui::PopFont();
+
+    ImGui::Spacing();
+    if (ImGui::BeginTabBar("LibraryTabs")) {
+        if (ImGui::BeginTabItem("Search")) {
+            ImGui::Spacing();
+            render_search_contents();
+            ImGui::EndTabItem();
+        }
+        const std::string playlist_tab = g_playlist_store == nullptr ? "Playlists" :
+            "Playlists (" + std::to_string(g_playlist_store->playlists().size()) + ")";
+        if (ImGui::BeginTabItem(playlist_tab.c_str())) {
+            ImGui::Spacing();
+            render_playlist_contents();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
     }
 
     ImGui::EndChild();
@@ -595,7 +833,7 @@ void render_now_playing(float width, float height) {
         if (g_font_heading) ImGui::PushFont(g_font_heading);
         ImGui::TextWrapped("Choose a song to start listening");
         if (g_font_heading) ImGui::PopFont();
-        text_muted("Search YouTube on the left, then play any result.");
+        text_muted("Search YouTube or open a saved playlist from the Library.");
     } else {
         const TrackInfo& track = *g_current_track;
         if (g_font_heading) ImGui::PushFont(g_font_heading);
@@ -620,10 +858,19 @@ void render_now_playing(float width, float height) {
             text_muted(duration.c_str());
         }
 
+        if (!track.id.empty()) {
+            ImGui::Spacing();
+            if (ImGui::Button("Add to playlist")) {
+                request_add_to_playlist(search_track_from_current());
+            }
+        }
+
         ImGui::Spacing();
         if (ImGui::CollapsingHeader("Track details")) {
             if (!track.id.empty()) ImGui::Text("Video ID: %s", track.id.c_str());
             if (!track.format_id.empty()) ImGui::Text("Format: %s", track.format_id.c_str());
+            if (track.abr_kbps > 0.0) ImGui::Text("Source bitrate: %.0f kbps", track.abr_kbps);
+            if (track.sample_rate_hz > 0.0) ImGui::Text("Sample rate: %.0f Hz", track.sample_rate_hz);
             ImGui::TextWrapped("Source: %s", track.webpage_url.c_str());
             ImGui::Spacing();
             ImGui::TextUnformatted("Direct audio URL");
@@ -643,6 +890,131 @@ void render_now_playing(float width, float height) {
     }
 
     ImGui::EndChild();
+}
+
+void render_add_to_playlist_popup() {
+    if (g_request_add_popup) {
+        ImGui::OpenPopup("Add song to playlist");
+        g_request_add_popup = false;
+    }
+
+    if (!ImGui::BeginPopupModal("Add song to playlist", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    if (!g_add_to_playlist_track || g_playlist_store == nullptr) {
+        text_muted("No song selected.");
+        if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+
+    ImGui::TextWrapped("%s", g_add_to_playlist_track->title.c_str());
+    ImGui::Spacing();
+
+    auto& playlists = g_playlist_store->playlists();
+    if (playlists.empty()) {
+        text_muted("No playlists yet. Create one below.");
+    } else {
+        for (int i = 0; i < static_cast<int>(playlists.size()); ++i) {
+            ImGui::PushID(i);
+            const std::string label = playlists[static_cast<std::size_t>(i)].name +
+                                      "  (" + std::to_string(playlists[static_cast<std::size_t>(i)].tracks.size()) + ")";
+            if (ImGui::Button(label.c_str(), ImVec2(330.0f, 0.0f))) {
+                std::string error;
+                if (g_playlist_store->add_track(static_cast<std::size_t>(i),
+                                                *g_add_to_playlist_track, &error)) {
+                    g_selected_playlist = i;
+                    g_status = "Added to " + playlists[static_cast<std::size_t>(i)].name;
+                    g_add_to_playlist_track.reset();
+                    ImGui::CloseCurrentPopup();
+                } else if (!error.empty()) {
+                    g_status = error;
+                }
+            }
+            ImGui::PopID();
+        }
+    }
+
+    ImGui::Separator();
+    ImGui::SetNextItemWidth(220.0f);
+    ImGui::InputTextWithHint("##popup-new-playlist", "New playlist name...",
+                             g_playlist_name_buffer.data(), g_playlist_name_buffer.size());
+    ImGui::SameLine();
+    if (ImGui::Button("Create + Add")) {
+        std::string error;
+        const int created = g_playlist_store->create(g_playlist_name_buffer.data(), &error);
+        if (created >= 0) {
+            if (g_playlist_store->add_track(static_cast<std::size_t>(created),
+                                            *g_add_to_playlist_track, &error)) {
+                g_selected_playlist = created;
+                g_playlist_name_buffer.fill('\0');
+                g_status = "Playlist created and song added";
+                g_add_to_playlist_track.reset();
+                ImGui::CloseCurrentPopup();
+            } else if (!error.empty()) {
+                g_status = error;
+            }
+        } else if (!error.empty()) {
+            g_status = error;
+        }
+    }
+
+    if (ImGui::Button("Cancel")) {
+        g_add_to_playlist_track.reset();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void start_previous_track() {
+    if (g_resolve_busy) return;
+    if (g_queue_source == ResolveSource::Search && g_current_index > 0) {
+        start_track_index(g_current_index - 1);
+        return;
+    }
+    if (g_queue_source == ResolveSource::Playlist && g_current_playlist_track > 0) {
+        start_playlist_track(g_current_playlist, g_current_playlist_track - 1);
+    }
+}
+
+void start_next_track() {
+    if (g_resolve_busy) return;
+    if (g_queue_source == ResolveSource::Search &&
+        g_current_index >= 0 && g_current_index + 1 < static_cast<int>(g_search_results.size())) {
+        start_track_index(g_current_index + 1);
+        return;
+    }
+    if (g_queue_source == ResolveSource::Playlist && g_playlist_store != nullptr &&
+        g_current_playlist >= 0 &&
+        g_current_playlist < static_cast<int>(g_playlist_store->playlists().size())) {
+        const auto& tracks = g_playlist_store->playlists()[static_cast<std::size_t>(g_current_playlist)].tracks;
+        if (g_current_playlist_track >= 0 &&
+            g_current_playlist_track + 1 < static_cast<int>(tracks.size())) {
+            start_playlist_track(g_current_playlist, g_current_playlist_track + 1);
+        }
+    }
+}
+
+bool has_previous_track() {
+    if (g_queue_source == ResolveSource::Search) return g_current_index > 0;
+    if (g_queue_source == ResolveSource::Playlist) return g_current_playlist_track > 0;
+    return false;
+}
+
+bool has_next_track() {
+    if (g_queue_source == ResolveSource::Search) {
+        return g_current_index >= 0 &&
+               g_current_index + 1 < static_cast<int>(g_search_results.size());
+    }
+    if (g_queue_source == ResolveSource::Playlist && g_playlist_store != nullptr &&
+        g_current_playlist >= 0 &&
+        g_current_playlist < static_cast<int>(g_playlist_store->playlists().size())) {
+        const auto& tracks = g_playlist_store->playlists()[static_cast<std::size_t>(g_current_playlist)].tracks;
+        return g_current_playlist_track >= 0 &&
+               g_current_playlist_track + 1 < static_cast<int>(tracks.size());
+    }
+    return false;
 }
 
 void render_player_bar(float height) {
@@ -674,19 +1046,19 @@ void render_player_bar(float height) {
     }
     ImGui::PopStyleVar();
 
-    const float controls_y = ImGui::GetCursorPosY() + 2.0f;
+    // Anchor transport controls from the bottom instead of relying on layout flow.
+    // This leaves a fixed safe margin and prevents the 58 px play button from being clipped.
+    const float controls_y = std::max(ImGui::GetCursorPosY() + 8.0f, height - 78.0f);
     ImGui::SetCursorPosY(controls_y);
 
-    const float center_width = 48.0f + 14.0f + 58.0f + 14.0f + 48.0f + 14.0f + 42.0f;
+    const float center_width = 42.0f + 14.0f + 58.0f + 14.0f + 42.0f + 14.0f + 42.0f;
     ImGui::SetCursorPosX((ImGui::GetWindowWidth() - center_width) * 0.5f);
 
-    const bool has_prev = g_current_index > 0;
-    const bool has_next = g_current_index >= 0 && g_current_index + 1 < static_cast<int>(g_search_results.size());
+    const bool has_prev = has_previous_track();
+    const bool has_next = has_next_track();
 
     ImGui::BeginDisabled(!has_prev || g_resolve_busy);
-    if (transport_button("##prev", TransportIcon::Previous, 42.0f, false) && has_prev) {
-        start_track_index(g_current_index - 1);
-    }
+    if (transport_button("##prev", TransportIcon::Previous, 42.0f, false)) start_previous_track();
     ImGui::EndDisabled();
     ImGui::SameLine(0.0f, 14.0f);
 
@@ -706,9 +1078,7 @@ void render_player_bar(float height) {
     ImGui::SameLine(0.0f, 14.0f);
 
     ImGui::BeginDisabled(!has_next || g_resolve_busy);
-    if (transport_button("##next", TransportIcon::Next, 42.0f, false) && has_next) {
-        start_track_index(g_current_index + 1);
-    }
+    if (transport_button("##next", TransportIcon::Next, 42.0f, false)) start_next_track();
     ImGui::EndDisabled();
     ImGui::SameLine(0.0f, 14.0f);
 
@@ -717,7 +1087,7 @@ void render_player_bar(float height) {
     }
 
     const float volume_width = 180.0f;
-    ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - volume_width - 18.0f, controls_y + 8.0f));
+    ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - volume_width - 18.0f, controls_y + 9.0f));
     if (g_font_small) ImGui::PushFont(g_font_small);
     ImGui::TextUnformatted("VOL");
     if (g_font_small) ImGui::PopFont();
@@ -729,7 +1099,7 @@ void render_player_bar(float height) {
         if (g_backend != nullptr) g_backend->set_volume(g_volume);
     }
 
-    ImGui::SetCursorPos(ImVec2(18.0f, controls_y + 11.0f));
+    ImGui::SetCursorPos(ImVec2(18.0f, controls_y + 14.0f));
     ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
     if (g_font_small) ImGui::PushFont(g_font_small);
     ImGui::TextUnformatted(g_status.c_str());
@@ -757,22 +1127,23 @@ void render_app() {
     if (g_font_display) ImGui::PopFont();
     ImGui::SameLine();
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 10.0f);
-    text_muted("direct audio player");
+    text_muted("direct audio player • v0.5");
 
     ImGui::Spacing();
 
-    const float player_height = 132.0f;
+    const float player_height = 172.0f;
     const float content_height = std::max(260.0f, ImGui::GetContentRegionAvail().y - player_height - 10.0f);
     const float available_width = ImGui::GetContentRegionAvail().x;
     const float left_width = std::max(480.0f, available_width * 0.61f);
     const float right_width = std::max(340.0f, available_width - left_width - 10.0f);
 
-    render_search_panel(left_width, content_height);
+    render_library_panel(left_width, content_height);
     ImGui::SameLine();
     render_now_playing(right_width, content_height);
 
     ImGui::Spacing();
     render_player_bar(player_height);
+    render_add_to_playlist_popup();
 
     ImGui::End();
     ImGui::PopStyleVar();
@@ -792,11 +1163,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     window_class.hInstance = instance;
     window_class.lpszClassName = L"PcYoutubeMusicImGui";
     window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    window_class.hIcon = static_cast<HICON>(LoadImageW(
+        instance, MAKEINTRESOURCEW(kAppIconResourceId), IMAGE_ICON, 64, 64, LR_DEFAULTCOLOR));
+    window_class.hIconSm = static_cast<HICON>(LoadImageW(
+        instance, MAKEINTRESOURCEW(kAppIconResourceId), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
     RegisterClassExW(&window_class);
 
     HWND window = CreateWindowW(
         window_class.lpszClassName, L"PcYoutube Music",
-        WS_OVERLAPPEDWINDOW, 100, 80, 1240, 820,
+        WS_OVERLAPPEDWINDOW, 100, 80, 1240, 850,
         nullptr, nullptr, window_class.hInstance, nullptr);
     if (window == nullptr) {
         UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
@@ -828,7 +1203,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     ImGui_ImplDX11_Init(g_device, g_device_context);
 
     AudioBackend backend;
+    PlaylistStore playlist_store;
     g_backend = &backend;
+    g_playlist_store = &playlist_store;
+
+    std::string playlist_error;
+    if (!playlist_store.load(&playlist_error) && !playlist_error.empty()) {
+        g_status = playlist_error;
+    } else if (!playlist_store.playlists().empty()) {
+        g_selected_playlist = 0;
+    }
     if (!backend.ready()) {
         g_status = backend.readiness_error();
     }
@@ -876,6 +1260,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
     backend.shutdown();
     g_backend = nullptr;
+    g_playlist_store = nullptr;
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
