@@ -1,19 +1,20 @@
 # PcYoutube Music
 
-Current prototype: **v0.5**.
+Current prototype: **v0.6**.
 
 PcYoutube Music is a lightweight native C++ Windows music player. It does not use WebView. Search and metadata are handled by `yt-dlp`; playback uses a direct media URL in an audio-only `mpv` process.
 
-## What is new in v0.5
+## What is new in v0.6
 
-- persistent playlists stored in `%LOCALAPPDATA%\PcYoutube\playlists.json`;
-- create/delete playlists, add/remove songs, and play directly from a playlist;
-- Previous/Next follows the active search list or active playlist;
-- fixed transport-bar layout so the large Play/Pause button keeps safe bottom padding;
-- source-oriented quality presets: **Best source**, **Prefer Opus**, **Prefer AAC / M4A**, and **Data saver**;
-- actual resolved codec, extension, source bitrate and sample rate are shown after resolving;
-- custom Windows application icon plus version metadata embedded into `PcYoutube.exe`;
-- `SHA256SUMS.txt` is included in CI artifacts for the main executable and bundled runtime tools.
+- real YouTube thumbnails in Search, Playlists and Now Playing;
+- thumbnails are downloaded asynchronously with WinHTTP and decoded with Windows Imaging Component, so the UI does not block on image loading;
+- **Shuffle** mode for the active Search queue or Playlist queue;
+- **Repeat Off / Repeat All / Repeat One** modes;
+- automatic next-track playback when mpv reports the current song finished;
+- manual Stop is distinguished from end-of-track, so Stop does not accidentally auto-advance;
+- drag a playlist row by its `::` handle and drop it on another row to reorder tracks;
+- persistent player preferences: volume, audio-quality preset, selected playlist, Shuffle and Repeat mode;
+- previous behavior retained: persistent playlists, search results, direct URLs, source codec/bitrate display, seeking, volume and native application icon.
 
 ## Search and playback
 
@@ -34,30 +35,47 @@ Search / YouTube URL
       speakers
 ```
 
-The resolved direct URL is temporary. PcYoutube resolves it again whenever a song is selected from search or a playlist.
+The resolved direct URL is temporary. PcYoutube resolves it again whenever a song is selected from Search or a Playlist.
+
+## Thumbnails
+
+For a YouTube video id, v0.6 requests the standard JPEG thumbnail from `i.ytimg.com` on a background worker. Windows Imaging Component decodes the JPEG directly into a D3D11 texture used by Dear ImGui.
+
+This keeps the application native and avoids adding an embedded browser or a separate image-decoding framework.
 
 ## Audio quality
 
-PcYoutube v0.5 does **not** transcode audio. The selector chooses among formats that the source actually provides:
+PcYoutube does **not** transcode audio. The selector chooses among formats that the source actually provides:
 
 - **Best source** — best available audio-only stream;
 - **Prefer Opus** — prefer an Opus/WebM source, then fall back to best available;
 - **Prefer AAC / M4A** — prefer M4A/AAC, then fall back to best available;
-- **Data saver** — prefer a source at or below roughly 64 kbps, with a low-quality fallback.
+- **Data saver** — prefer a low-bitrate source.
 
-An MP3 label such as `320 kbps` would be misleading for direct streaming when YouTube does not provide a 320 kbps MP3 source. Converting a lower-bitrate AAC/Opus stream to MP3 320 kbps would only make a larger stream/file; it would not restore audio information that was not present in the source.
+The actual resolved extension, codec, source bitrate and sample rate are shown in Now Playing when yt-dlp reports them.
 
 ## Playlists
 
-Open the **Playlists** tab in Library to create playlists. Search results and the currently playing song both have an **Add** / **Add to playlist** action.
+Open the **Playlists** tab in Library to create playlists. Search results and the currently playing song both have an Add action.
 
-Playlist data is stored outside the program folder at:
+Playlist data and player preferences are stored at:
 
 ```text
 %LOCALAPPDATA%\PcYoutube\playlists.json
 ```
 
-This means replacing `PcYoutube.exe` with a newer build does not remove your playlists.
+The file now contains both the playlist library and v0.6 settings. Existing v0.5 playlist files remain readable; missing settings simply use defaults.
+
+Drag the `::` handle on a playlist row and drop it onto another row to change its position. The playing-track index is adjusted with the move so Previous/Next continues from the correct place.
+
+## Playback modes
+
+- **Shuffle** — Next/auto-next chooses another track from the active queue.
+- **Repeat** — normal playback; playback stops after the final queue item.
+- **Repeat ALL** — the final queue item wraps to the first.
+- **Repeat ONE** — when a track finishes, the same resolved stream is played again.
+
+When Previous is pressed more than four seconds into a song, it seeks to the start of the current song first.
 
 ## Runtime package
 
@@ -82,11 +100,11 @@ See `THIRD_PARTY.md` for upstream/source and license information.
 
 ## Windows SmartScreen / antivirus notes
 
-The development builds are currently **not code-signed**. A newly generated unsigned executable has no publisher reputation, so Windows Defender SmartScreen can show **Windows protected your PC** / **Run anyway** even when the build is clean. Each unsigned release has a new file hash and must build reputation again.
+The development builds are currently **not code-signed**. A newly generated unsigned executable has no publisher reputation, so Windows Defender SmartScreen can show **Windows protected your PC** / **Run anyway**. Each unsigned release has a new file hash and must build reputation again.
 
-The app also launches the bundled `yt-dlp.exe` and `mpv.exe`, communicates with mpv through a local named pipe, and opens temporary media URLs. Those behaviors can receive extra heuristic scrutiny from security products, but they are expected parts of the architecture.
+The app launches the bundled `yt-dlp.exe` and `mpv.exe`, communicates with mpv through a local named pipe, downloads thumbnails over HTTPS, and opens temporary media URLs. These are expected parts of the architecture but can receive extra heuristic scrutiny from security products.
 
-For distribution, use a trusted code-signing certificate consistently or publish through a trusted store/channel. Self-signing alone does not establish public SmartScreen reputation. CI includes `SHA256SUMS.txt` so downloaded files can be compared with the build artifact hashes.
+CI includes `SHA256SUMS.txt` so downloaded files can be compared with the build artifact hashes.
 
 ## Architecture
 
@@ -100,10 +118,12 @@ src/music/
    ├─ audio_backend.cpp
    ├─ playlist_store.h
    ├─ playlist_store.cpp
+   ├─ thumbnail_cache.h
+   ├─ thumbnail_cache.cpp
    └─ main_win32.cpp
 ```
 
-The UI is Dear ImGui + Direct3D 11. `audio_backend` owns yt-dlp/mpv process work and IPC. `playlist_store` owns persistent library data.
+The UI is Dear ImGui + Direct3D 11. `audio_backend` owns yt-dlp/mpv process work and IPC. `playlist_store` owns persistent library/settings data. `thumbnail_cache` owns asynchronous HTTPS thumbnail download, WIC decode and D3D11 texture caching.
 
 ## Build
 
@@ -126,4 +146,4 @@ For normal playback, put `yt-dlp.exe` at `out\tools\yt-dlp.exe` and `mpv.exe` at
 
 ## CI
 
-`.github/workflows/windows-cmake.yml` builds Windows x64 Release, runs CTest and the native self-test, downloads pinned yt-dlp/mpv binaries, generates package checksums, and uploads the complete `out/` directory as `PcYoutube-Music-v0.5-windows-x64`.
+`.github/workflows/windows-cmake.yml` builds Windows x64 Release, runs CTest and the native self-test, downloads pinned yt-dlp/mpv binaries, generates package checksums, and uploads the complete `out/` directory as `PcYoutube-Music-v0.6-windows-x64`.
