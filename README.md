@@ -1,51 +1,63 @@
 # PcYoutube Music
 
-Current prototype: **v0.4**.
+Current prototype: **v0.5**.
 
-PcYoutube Music is a native C++ Windows audio player for YouTube media. It does not use WebView or an embedded browser. `yt-dlp` performs keyword search, metadata extraction and direct audio URL resolution; `mpv` handles audio-only playback.
+PcYoutube Music is a lightweight native C++ Windows music player. It does not use WebView. Search and metadata are handled by `yt-dlp`; playback uses a direct media URL in an audio-only `mpv` process.
 
-## v0.4 highlights
+## What is new in v0.5
 
-- Modern dark Dear ImGui + Direct3D 11 interface with smooth vsync rendering.
-- Real keyword search with a scrollable list of up to 16 YouTube results.
-- Double-click or press **Play** on a result to resolve and start it.
-- Large visual Play/Pause, Previous, Next and Stop transport controls.
-- Realtime progress bar with current time, duration and seeking.
-- Realtime pause/playback state and volume through mpv named-pipe IPC.
-- Audio quality presets: **Best**, **High**, **Balanced** and **Data saver**.
-- Expanded track information: title, channel, duration, requested quality, container, audio codec, bitrate, sample rate, format ID, source URL and direct audio URL.
-- Direct YouTube URL and 11-character video ID input are still supported.
+- persistent playlists stored in `%LOCALAPPDATA%\PcYoutube\playlists.json`;
+- create/delete playlists, add/remove songs, and play directly from a playlist;
+- Previous/Next follows the active search list or active playlist;
+- fixed transport-bar layout so the large Play/Pause button keeps safe bottom padding;
+- source-oriented quality presets: **Best source**, **Prefer Opus**, **Prefer AAC / M4A**, and **Data saver**;
+- actual resolved codec, extension, source bitrate and sample rate are shown after resolving;
+- custom Windows application icon plus version metadata embedded into `PcYoutube.exe`;
+- `SHA256SUMS.txt` is included in CI artifacts for the main executable and bundled runtime tools.
 
-## Playback flow
+## Search and playback
+
+Enter a song, artist or album name to receive a list of results. A normal YouTube URL or 11-character video ID can also be pasted directly.
 
 ```text
-keyword / YouTube URL / video ID
-             |
-             v
-           yt-dlp
-     search + metadata
-     quality selection
-     direct audio URL
-             |
-             v
-       mpv --no-video
-             |
-             v
-          speakers
+Search / YouTube URL
+        |
+        v
+      yt-dlp
+  metadata + selected
+  direct audio stream
+        |
+        v
+   mpv --no-video
+        |
+        v
+      speakers
 ```
 
-The media URL is resolved fresh for every selected song because YouTube delivery URLs are temporary.
+The resolved direct URL is temporary. PcYoutube resolves it again whenever a song is selected from search or a playlist.
 
-## Audio quality presets
+## Audio quality
 
-Quality is selected before opening a track:
+PcYoutube v0.5 does **not** transcode audio. The selector chooses among formats that the source actually provides:
 
-- **Best** - `bestaudio`
-- **High** - prefers audio streams at or above 160 kbps, with fallbacks.
-- **Balanced** - prefers streams at or below roughly 128 kbps, with fallbacks.
-- **Data saver** - `worstaudio`
+- **Best source** — best available audio-only stream;
+- **Prefer Opus** — prefer an Opus/WebM source, then fall back to best available;
+- **Prefer AAC / M4A** — prefer M4A/AAC, then fall back to best available;
+- **Data saver** — prefer a source at or below roughly 64 kbps, with a low-quality fallback.
 
-The actual codec/bitrate/sample rate returned by yt-dlp is shown in the Now Playing panel when available.
+An MP3 label such as `320 kbps` would be misleading for direct streaming when YouTube does not provide a 320 kbps MP3 source. Converting a lower-bitrate AAC/Opus stream to MP3 320 kbps would only make a larger stream/file; it would not restore audio information that was not present in the source.
+
+## Playlists
+
+Open the **Playlists** tab in Library to create playlists. Search results and the currently playing song both have an **Add** / **Add to playlist** action.
+
+Playlist data is stored outside the program folder at:
+
+```text
+%LOCALAPPDATA%\PcYoutube\playlists.json
+```
+
+This means replacing `PcYoutube.exe` with a newer build does not remove your playlists.
 
 ## Runtime package
 
@@ -54,11 +66,27 @@ out/
 ├─ PcYoutube.exe
 ├─ README.md
 ├─ THIRD_PARTY.md
+├─ SHA256SUMS.txt
 └─ tools/
    ├─ yt-dlp.exe
    └─ mpv/
       └─ mpv.exe
 ```
+
+The CI package currently pins:
+
+- yt-dlp `2026.08.19`
+- zhongfly mpv Windows build `2026-09-29-b4b5d69a44`
+
+See `THIRD_PARTY.md` for upstream/source and license information.
+
+## Windows SmartScreen / antivirus notes
+
+The development builds are currently **not code-signed**. A newly generated unsigned executable has no publisher reputation, so Windows Defender SmartScreen can show **Windows protected your PC** / **Run anyway** even when the build is clean. Each unsigned release has a new file hash and must build reputation again.
+
+The app also launches the bundled `yt-dlp.exe` and `mpv.exe`, communicates with mpv through a local named pipe, and opens temporary media URLs. Those behaviors can receive extra heuristic scrutiny from security products, but they are expected parts of the architecture.
+
+For distribution, use a trusted code-signing certificate consistently or publish through a trusted store/channel. Self-signing alone does not establish public SmartScreen reputation. CI includes `SHA256SUMS.txt` so downloaded files can be compared with the build artifact hashes.
 
 ## Architecture
 
@@ -67,18 +95,19 @@ src/music/
 ├─ core/
 │  ├─ music_app.h
 │  └─ music_app.cpp
-└─ platform/
-   └─ windows/
-      ├─ audio_backend.h
-      ├─ audio_backend.cpp
-      └─ main_win32.cpp
+└─ platform/windows/
+   ├─ audio_backend.h
+   ├─ audio_backend.cpp
+   ├─ playlist_store.h
+   ├─ playlist_store.cpp
+   └─ main_win32.cpp
 ```
 
-`pcyoutube_core` contains portable input/search/quality helpers. `audio_backend` owns yt-dlp process execution, structured JSON parsing and mpv IPC. `main_win32.cpp` is only the Dear ImGui/D3D11 presentation and user interaction layer.
+The UI is Dear ImGui + Direct3D 11. `audio_backend` owns yt-dlp/mpv process work and IPC. `playlist_store` owns persistent library data.
 
-This separation keeps the project ready for a future Android frontend/backend without coupling the application logic to Win32 controls.
+## Build
 
-## Windows build
+Using an MSVC developer environment with CMake and Ninja:
 
 ```powershell
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -86,15 +115,15 @@ cmake --build build --parallel
 .\out\PcYoutube.exe --self-test
 ```
 
-CMake fetches Dear ImGui and nlohmann/json. For normal playback, place `yt-dlp.exe` at `out\tools\yt-dlp.exe` and `mpv.exe` at `out\tools\mpv\mpv.exe`; GitHub Actions packages them automatically.
+For normal playback, put `yt-dlp.exe` at `out\tools\yt-dlp.exe` and `mpv.exe` at `out\tools\mpv\mpv.exe`. GitHub Actions does this automatically for release artifacts.
 
 ## Notes
 
-- Direct media URLs are temporary; select/play the song again to obtain a fresh URL.
+- Direct media URLs are temporary and may expire.
 - Extraction can stop working when YouTube changes delivery logic; updating yt-dlp is usually the first fix.
-- Some media can require authentication, region access, age verification or other session context.
-- This is an unofficial client. Use it only for media you are permitted to access and account for the applicable platform/content terms.
+- Some videos can require authentication, region access, age verification, or other session context.
+- Use the application only with media you are permitted to access.
 
 ## CI
 
-`.github/workflows/windows-cmake.yml` builds Windows x64 Release, runs CTest and the native self-test, bundles the pinned yt-dlp and mpv runtime tools, and uploads the complete `out/` package.
+`.github/workflows/windows-cmake.yml` builds Windows x64 Release, runs CTest and the native self-test, downloads pinned yt-dlp/mpv binaries, generates package checksums, and uploads the complete `out/` directory as `PcYoutube-Music-v0.5-windows-x64`.
