@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "music_app.h"
@@ -29,6 +30,7 @@ struct TrackInfo {
     std::string format_id;
     std::string extension;
     std::string codec;
+    std::vector<std::pair<std::string, std::string>> http_headers;
     double duration = 0.0;
     double abr_kbps = 0.0;
     double sample_rate_hz = 0.0;
@@ -59,11 +61,14 @@ public:
 
     bool ready() const;
     std::string readiness_error() const;
+    std::string runtime_summary() const;
+    const std::string& last_error() const noexcept { return last_error_; }
 
     std::vector<SearchTrack> search(std::string_view query, int max_results, std::string& error) const;
     BackendResult resolve(std::string_view target, music::AudioQuality quality) const;
 
     bool play(const TrackInfo& track);
+    bool play_via_extractor(const TrackInfo& track);
     bool toggle_pause();
     bool stop();
     bool seek(double seconds);
@@ -75,15 +80,18 @@ public:
 private:
     bool start_mpv();
     bool send_command(std::string_view json_command, std::string* response = nullptr);
+    bool configure_http_headers(const TrackInfo& track);
     std::optional<double> query_number(std::string_view property);
     std::optional<bool> query_bool(std::string_view property);
 
     std::filesystem::path exe_dir_;
     std::filesystem::path yt_dlp_path_;
+    std::filesystem::path deno_path_;
     std::filesystem::path mpv_path_;
     std::wstring mpv_pipe_name_;
     void* mpv_process_ = nullptr;
     int volume_ = 75;
+    std::string last_error_;
     std::mutex mpv_mutex_;
 };
 
