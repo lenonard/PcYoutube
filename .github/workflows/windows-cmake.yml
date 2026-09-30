@@ -181,6 +181,7 @@ jobs:
           } elseif ($smokeText -match "Sign in to confirm you.*not a bot" -or
                     $smokeText -match "confirm you.*not a bot") {
             Write-Warning "YouTube challenged the GitHub runner IP. yt-dlp, Deno and mpv packaging checks passed; live YouTube resolve is inconclusive on this CI host."
+            $global:LASTEXITCODE = 0
           } else {
             throw "YouTube resolve smoke test failed with exit code $smokeExit for a reason other than the known CI bot challenge."
           }
