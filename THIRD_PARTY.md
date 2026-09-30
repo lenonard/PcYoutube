@@ -1,13 +1,13 @@
 # Third-party components
 
-PcYoutube Music v0.4 uses two runtime tools and two source dependencies fetched at build time.
+PcYoutube Music v0.5 uses two runtime tools and two source dependencies fetched at build time.
 
 ## yt-dlp
 
 - Project: https://github.com/yt-dlp/yt-dlp
 - Packaged version: 2026.08.19
 - Windows binary: `yt-dlp.exe`
-- Purpose: YouTube keyword search, metadata extraction, quality-aware format selection and direct audio URL resolution.
+- Purpose: YouTube keyword search, metadata extraction, source-format selection and direct audio URL resolution.
 - License: Unlicense (see the upstream project for the authoritative license text).
 
 ## mpv
@@ -30,7 +30,7 @@ PcYoutube Music v0.4 uses two runtime tools and two source dependencies fetched 
 
 - Project: https://github.com/nlohmann/json
 - Version/tag: `v3.12.0`
-- Purpose: parse structured search/track metadata from yt-dlp and mpv IPC responses.
+- Purpose: parse structured yt-dlp/mpv data and persist user playlists as JSON.
 - License: MIT.
 
 GitHub Actions fetches source dependencies during CMake configure and downloads the yt-dlp/mpv runtime binaries while creating the Windows artifact.
