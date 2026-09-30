@@ -55,6 +55,7 @@ std::filesystem::path executable_directory() {
 }
 
 bool file_exists(const std::filesystem::path& path) {
+    if (path.empty()) return false;
     std::error_code error;
     return std::filesystem::exists(path, error) && !error &&
            std::filesystem::is_regular_file(path, error) && !error;
@@ -525,6 +526,28 @@ bool AudioBackend::configure_http_headers(const TrackInfo& track) {
     return send_command(command.dump());
 }
 
+void AudioBackend::cancel_playback_watch() {
+    if (!playback_watch_thread_.joinable()) return;
+    playback_watch_thread_.request_stop();
+    if (playback_watch_thread_.get_id() != std::this_thread::get_id()) {
+        playback_watch_thread_.join();
+    }
+}
+
+void AudioBackend::arm_playback_fallback(const TrackInfo& track) {
+    playback_watch_thread_ = std::jthread([this, track](std::stop_token token) {
+        for (int i = 0; i < 70 && !token.stop_requested(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (token.stop_requested()) return;
+
+        const bool idle = query_bool("idle-active").value_or(false);
+        if (!idle || token.stop_requested()) return;
+
+        play_via_extractor(track);
+    });
+}
+
 std::optional<double> AudioBackend::query_number(std::string_view property) {
     static std::atomic_uint request_id{1};
     const unsigned id = request_id.fetch_add(1);
@@ -564,6 +587,7 @@ std::optional<bool> AudioBackend::query_bool(std::string_view property) {
 }
 
 bool AudioBackend::play(const TrackInfo& track) {
+    cancel_playback_watch();
     last_error_.clear();
     if (track.direct_url.empty()) {
         last_error_ = "The resolved track has no direct media URL.";
@@ -572,6 +596,7 @@ bool AudioBackend::play(const TrackInfo& track) {
     if (!configure_http_headers(track)) return false;
     json command = {{"command", {"loadfile", track.direct_url, "replace"}}};
     if (!send_command(command.dump())) return false;
+    arm_playback_fallback(track);
     return true;
 }
 
@@ -593,8 +618,7 @@ bool AudioBackend::play_via_extractor(const TrackInfo& track) {
     TrackInfo empty_headers;
     if (!configure_http_headers(empty_headers)) return false;
     json command = {{"command", {"loadfile", track.webpage_url, "replace"}}};
-    if (!send_command(command.dump())) return false;
-    return true;
+    return send_command(command.dump());
 }
 
 bool AudioBackend::toggle_pause() {
@@ -604,6 +628,7 @@ bool AudioBackend::toggle_pause() {
 }
 
 bool AudioBackend::stop() {
+    cancel_playback_watch();
     if (mpv_process_ == nullptr) return true;
     return send_command(R"({"command":["stop"]})");
 }
@@ -639,6 +664,7 @@ PlaybackSnapshot AudioBackend::snapshot() {
 }
 
 void AudioBackend::shutdown() {
+    cancel_playback_watch();
     if (mpv_process_ == nullptr) return;
 
     send_command(R"({"command":["quit"]})");
