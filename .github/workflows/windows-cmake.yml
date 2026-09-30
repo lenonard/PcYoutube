@@ -100,7 +100,7 @@ jobs:
           if ($process.ExitCode -ne 0) {
             throw "PcYoutube self-test failed with exit code $($process.ExitCode)"
           }
-          Write-Host "PcYoutube v0.5 core self-test passed."
+          Write-Host "PcYoutube v0.6 core self-test passed."
 
       - name: Bundle yt-dlp and mpv audio engine
         shell: pwsh
@@ -133,17 +133,11 @@ jobs:
             Copy-Item -Path (Join-Path $mpvExe.DirectoryName "*") -Destination $mpvDir -Recurse -Force
           }
 
-          if (-not (Test-Path $ytDlpPath)) {
-            throw "yt-dlp.exe missing from packaged tools."
-          }
-          if (-not (Test-Path $expectedMpv)) {
-            throw "mpv.exe missing from packaged tools."
-          }
+          if (-not (Test-Path $ytDlpPath)) { throw "yt-dlp.exe missing from packaged tools." }
+          if (-not (Test-Path $expectedMpv)) { throw "mpv.exe missing from packaged tools." }
 
           & $ytDlpPath --version
-          if ($LASTEXITCODE -ne 0) {
-            throw "yt-dlp version check failed."
-          }
+          if ($LASTEXITCODE -ne 0) { throw "yt-dlp version check failed." }
           Get-Item $expectedMpv | Format-List FullName, Length, LastWriteTime
 
           Copy-Item README.md out\README.md -Force
@@ -171,7 +165,7 @@ jobs:
       - name: Upload Windows x64 package
         uses: actions/upload-artifact@v4
         with:
-          name: PcYoutube-Music-v0.5-windows-x64
+          name: PcYoutube-Music-v0.6-windows-x64
           path: artifact/
           if-no-files-found: error
           retention-days: 7
