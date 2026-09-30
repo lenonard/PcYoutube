@@ -13,6 +13,8 @@ permissions:
 env:
   BUILD_TYPE: Release
   YTDLP_VERSION: "2026.08.19"
+  DENO_VERSION: "v2.9.7"
+  DENO_ARCHIVE: "deno-x86_64-pc-windows-msvc.zip"
   MPV_TAG: "2026-09-29-b4b5d69a44"
   MPV_ARCHIVE: "mpv-x86_64-20260929-git-b4b5d69a44.7z"
 
@@ -86,7 +88,11 @@ jobs:
             throw "Executable not found: $exe"
           }
           Get-Item $exe | Format-List FullName, Length, LastWriteTime
-          (Get-Item $exe).VersionInfo | Format-List ProductName, ProductVersion, FileDescription, FileVersion
+          $info = (Get-Item $exe).VersionInfo
+          $info | Format-List ProductName, ProductVersion, FileDescription, FileVersion
+          if ($info.ProductVersion -notlike "0.7.0*") {
+            throw "Expected ProductVersion 0.7.0, got $($info.ProductVersion)"
+          }
 
       - name: Run CTest
         shell: pwsh
@@ -100,9 +106,9 @@ jobs:
           if ($process.ExitCode -ne 0) {
             throw "PcYoutube self-test failed with exit code $($process.ExitCode)"
           }
-          Write-Host "PcYoutube v0.6 core self-test passed."
+          Write-Host "PcYoutube v0.7 core self-test passed."
 
-      - name: Bundle yt-dlp and mpv audio engine
+      - name: Bundle yt-dlp, Deno and mpv runtime
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -111,10 +117,19 @@ jobs:
           New-Item -ItemType Directory -Force -Path $tools | Out-Null
           New-Item -ItemType Directory -Force -Path $mpvDir | Out-Null
 
+          # yt-dlp: official Windows executable. Official builds include yt-dlp-ejs.
           $ytDlpUrl = "https://github.com/yt-dlp/yt-dlp/releases/download/${{ env.YTDLP_VERSION }}/yt-dlp.exe"
           $ytDlpPath = Join-Path $tools "yt-dlp.exe"
           Invoke-WebRequest -Uri $ytDlpUrl -OutFile $ytDlpPath
 
+          # Deno is the yt-dlp-recommended JavaScript runtime for YouTube challenge solving.
+          $denoUrl = "https://github.com/denoland/deno/releases/download/${{ env.DENO_VERSION }}/${{ env.DENO_ARCHIVE }}"
+          $denoArchive = Join-Path $env:RUNNER_TEMP "pcyoutube-deno.zip"
+          Invoke-WebRequest -Uri $denoUrl -OutFile $denoArchive
+          Expand-Archive -Path $denoArchive -DestinationPath $tools -Force
+          $denoPath = Join-Path $tools "deno.exe"
+
+          # mpv audio engine.
           $mpvUrl = "https://github.com/zhongfly/mpv-winbuild/releases/download/${{ env.MPV_TAG }}/${{ env.MPV_ARCHIVE }}"
           $mpvArchivePath = Join-Path $env:RUNNER_TEMP "pcyoutube-mpv.7z"
           Invoke-WebRequest -Uri $mpvUrl -OutFile $mpvArchivePath
@@ -133,12 +148,35 @@ jobs:
             Copy-Item -Path (Join-Path $mpvExe.DirectoryName "*") -Destination $mpvDir -Recurse -Force
           }
 
-          if (-not (Test-Path $ytDlpPath)) { throw "yt-dlp.exe missing from packaged tools." }
-          if (-not (Test-Path $expectedMpv)) { throw "mpv.exe missing from packaged tools." }
+          foreach ($required in @($ytDlpPath, $denoPath, $expectedMpv)) {
+            if (-not (Test-Path $required)) {
+              throw "Required runtime missing from package: $required"
+            }
+          }
 
           & $ytDlpPath --version
           if ($LASTEXITCODE -ne 0) { throw "yt-dlp version check failed." }
+          & $denoPath --version | Select-Object -First 3
+          if ($LASTEXITCODE -ne 0) { throw "Deno version check failed." }
           Get-Item $expectedMpv | Format-List FullName, Length, LastWriteTime
+
+          # Exercise the exact YouTube extraction path used by Play. Search alone is not enough:
+          # full format extraction now needs a supported JavaScript runtime.
+          $smokeVideo = "https://www.youtube.com/watch?v=M7lc1UVf-VE"
+          $smokeOutput = & $ytDlpPath `
+            --no-config --no-playlist --no-warnings --no-progress `
+            --js-runtimes "deno:$denoPath" `
+            --simulate --format "bestaudio" --print "%(url)s" $smokeVideo 2>&1
+          $smokeExit = $LASTEXITCODE
+          $smokeOutput | Out-Host
+          if ($smokeExit -ne 0) {
+            throw "YouTube resolve smoke test failed with exit code $smokeExit."
+          }
+          $directUrl = $smokeOutput | Where-Object { "$_" -match '^https?://' } | Select-Object -First 1
+          if (-not $directUrl) {
+            throw "YouTube resolve smoke test returned no direct media URL."
+          }
+          Write-Host "YouTube resolve smoke test PASS: direct media URL received."
 
           Copy-Item README.md out\README.md -Force
           Copy-Item THIRD_PARTY.md out\THIRD_PARTY.md -Force
@@ -147,6 +185,7 @@ jobs:
           foreach ($item in @(
               @{ Path = "out\PcYoutube.exe"; Name = "PcYoutube.exe" },
               @{ Path = "out\tools\yt-dlp.exe"; Name = "tools/yt-dlp.exe" },
+              @{ Path = "out\tools\deno.exe"; Name = "tools/deno.exe" },
               @{ Path = "out\tools\mpv\mpv.exe"; Name = "tools/mpv/mpv.exe" }
           )) {
               $hash = (Get-FileHash $item.Path -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -155,17 +194,28 @@ jobs:
           Set-Content -Path out\SHA256SUMS.txt -Value $hashLines -Encoding ascii
           Get-Content out\SHA256SUMS.txt
 
-      - name: Stage artifact preserving out folder
+      - name: Verify release layout
         shell: pwsh
         run: |
-          Remove-Item -Recurse -Force artifact -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path artifact | Out-Null
-          Copy-Item -Recurse -Force out artifact\out
+          $required = @(
+            "out\PcYoutube.exe",
+            "out\tools\yt-dlp.exe",
+            "out\tools\deno.exe",
+            "out\tools\mpv\mpv.exe",
+            "out\README.md",
+            "out\SHA256SUMS.txt"
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path $path)) { throw "Release layout is missing $path" }
+          }
+          Get-ChildItem out -Recurse -File | ForEach-Object {
+            Write-Host $_.FullName.Substring((Resolve-Path out).Path.Length + 1)
+          }
 
       - name: Upload Windows x64 package
         uses: actions/upload-artifact@v4
         with:
-          name: PcYoutube-Music-v0.6-windows-x64
-          path: artifact/
+          name: PcYoutube-Music-v0.7-windows-x64
+          path: out/
           if-no-files-found: error
           retention-days: 7
