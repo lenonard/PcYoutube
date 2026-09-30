@@ -18,10 +18,7 @@ namespace {
 using json = nlohmann::json;
 
 std::wstring utf8_to_wide(std::string_view text) {
-    if (text.empty()) {
-        return {};
-    }
-
+    if (text.empty()) return {};
     int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
                                    static_cast<int>(text.size()), nullptr, 0);
     DWORD flags = MB_ERR_INVALID_CHARS;
@@ -30,13 +27,21 @@ std::wstring utf8_to_wide(std::string_view text) {
         size = MultiByteToWideChar(CP_UTF8, flags, text.data(),
                                    static_cast<int>(text.size()), nullptr, 0);
     }
-    if (size <= 0) {
-        return {};
-    }
-
+    if (size <= 0) return {};
     std::wstring result(static_cast<std::size_t>(size), L'\0');
     MultiByteToWideChar(CP_UTF8, flags, text.data(), static_cast<int>(text.size()),
                         result.data(), size);
+    return result;
+}
+
+std::string wide_to_utf8(std::wstring_view text) {
+    if (text.empty()) return {};
+    const int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                                         nullptr, 0, nullptr, nullptr);
+    if (size <= 0) return {};
+    std::string result(static_cast<std::size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                        result.data(), size, nullptr, nullptr);
     return result;
 }
 
@@ -44,22 +49,37 @@ std::filesystem::path executable_directory() {
     std::wstring buffer(32768, L'\0');
     const DWORD length = GetModuleFileNameW(nullptr, buffer.data(),
                                             static_cast<DWORD>(buffer.size()));
-    if (length == 0 || length >= buffer.size()) {
-        return std::filesystem::current_path();
-    }
+    if (length == 0 || length >= buffer.size()) return std::filesystem::current_path();
     buffer.resize(length);
     return std::filesystem::path(buffer).parent_path();
 }
 
 bool file_exists(const std::filesystem::path& path) {
+    if (path.empty()) return false;
     std::error_code error;
-    return std::filesystem::exists(path, error) && !error;
+    return std::filesystem::exists(path, error) && !error &&
+           std::filesystem::is_regular_file(path, error) && !error;
+}
+
+std::filesystem::path first_existing(std::initializer_list<std::filesystem::path> candidates) {
+    for (const auto& candidate : candidates) {
+        if (file_exists(candidate)) return candidate;
+    }
+    return {};
+}
+
+std::filesystem::path find_on_path(std::wstring_view filename) {
+    std::wstring name(filename);
+    std::wstring buffer(32768, L'\0');
+    const DWORD length = SearchPathW(nullptr, name.c_str(), nullptr,
+                                     static_cast<DWORD>(buffer.size()), buffer.data(), nullptr);
+    if (length == 0 || length >= buffer.size()) return {};
+    buffer.resize(length);
+    return std::filesystem::path(buffer);
 }
 
 std::wstring quote_argument(std::wstring_view argument) {
-    if (argument.empty()) {
-        return L"\"\"";
-    }
+    if (argument.empty()) return L"\"\"";
     if (argument.find_first_of(L" \t\"") == std::wstring_view::npos) {
         return std::wstring(argument);
     }
@@ -130,7 +150,6 @@ std::string run_process_capture(const std::filesystem::path& executable,
     }
 
     CloseHandle(process.hThread);
-
     std::string output;
     char buffer[8192];
     DWORD bytes_read = 0;
@@ -146,11 +165,9 @@ std::string run_process_capture(const std::filesystem::path& executable,
 }
 
 std::string compact_error(std::string value) {
-    if (value.empty()) {
-        return "The external tool returned no details.";
-    }
-    if (value.size() > 1200U) {
-        value.resize(1200U);
+    if (value.empty()) return "The external tool returned no details.";
+    if (value.size() > 1800U) {
+        value.resize(1800U);
         value += "...";
     }
     return value;
@@ -158,20 +175,13 @@ std::string compact_error(std::string value) {
 
 std::string json_string(const json& value, std::string_view key) {
     const auto it = value.find(std::string(key));
-    if (it == value.end() || it->is_null()) {
-        return {};
-    }
-    if (it->is_string()) {
-        return it->get<std::string>();
-    }
-    return {};
+    if (it == value.end() || it->is_null() || !it->is_string()) return {};
+    return it->get<std::string>();
 }
 
 double json_number(const json& value, std::string_view key) {
     const auto it = value.find(std::string(key));
-    if (it == value.end() || it->is_null() || !it->is_number()) {
-        return 0.0;
-    }
+    if (it == value.end() || it->is_null() || !it->is_number()) return 0.0;
     return it->get<double>();
 }
 
@@ -184,20 +194,27 @@ std::string channel_from_json(const json& value) {
 
 std::string thumbnail_from_json(const json& value) {
     std::string thumbnail = json_string(value, "thumbnail");
-    if (!thumbnail.empty()) {
-        return thumbnail;
-    }
-
+    if (!thumbnail.empty()) return thumbnail;
     const auto it = value.find("thumbnails");
     if (it != value.end() && it->is_array()) {
         for (auto rit = it->rbegin(); rit != it->rend(); ++rit) {
             const std::string url = json_string(*rit, "url");
-            if (!url.empty()) {
-                return url;
-            }
+            if (!url.empty()) return url;
         }
     }
     return {};
+}
+
+std::vector<std::pair<std::string, std::string>> headers_from_json(const json& value) {
+    std::vector<std::pair<std::string, std::string>> headers;
+    const auto it = value.find("http_headers");
+    if (it == value.end() || !it->is_object()) return headers;
+    for (auto header = it->begin(); header != it->end(); ++header) {
+        if (header.value().is_string()) {
+            headers.emplace_back(header.key(), header.value().get<std::string>());
+        }
+    }
+    return headers;
 }
 
 json unwrap_first_entry(json root) {
@@ -205,9 +222,7 @@ json unwrap_first_entry(json root) {
         const auto entries = root.find("entries");
         if (entries != root.end() && entries->is_array()) {
             for (const auto& entry : *entries) {
-                if (entry.is_object()) {
-                    return entry;
-                }
+                if (entry.is_object()) return entry;
             }
         }
     }
@@ -222,8 +237,27 @@ std::string make_watch_url(std::string_view id) {
 
 AudioBackend::AudioBackend() {
     exe_dir_ = executable_directory();
-    yt_dlp_path_ = exe_dir_ / L"tools" / L"yt-dlp.exe";
-    mpv_path_ = exe_dir_ / L"tools" / L"mpv" / L"mpv.exe";
+
+    yt_dlp_path_ = first_existing({
+        exe_dir_ / L"tools" / L"yt-dlp.exe",
+        exe_dir_ / L"yt-dlp.exe",
+        exe_dir_ / L"tools" / L"yt-dlp" / L"yt-dlp.exe",
+    });
+    if (yt_dlp_path_.empty()) yt_dlp_path_ = find_on_path(L"yt-dlp.exe");
+
+    deno_path_ = first_existing({
+        exe_dir_ / L"tools" / L"deno.exe",
+        exe_dir_ / L"deno.exe",
+        yt_dlp_path_.empty() ? std::filesystem::path{} : yt_dlp_path_.parent_path() / L"deno.exe",
+    });
+    if (deno_path_.empty()) deno_path_ = find_on_path(L"deno.exe");
+
+    mpv_path_ = first_existing({
+        exe_dir_ / L"tools" / L"mpv" / L"mpv.exe",
+        exe_dir_ / L"tools" / L"mpv.exe",
+        exe_dir_ / L"mpv.exe",
+    });
+    if (mpv_path_.empty()) mpv_path_ = find_on_path(L"mpv.exe");
 }
 
 AudioBackend::~AudioBackend() {
@@ -231,17 +265,32 @@ AudioBackend::~AudioBackend() {
 }
 
 bool AudioBackend::ready() const {
-    return file_exists(yt_dlp_path_) && file_exists(mpv_path_);
+    return file_exists(yt_dlp_path_) && file_exists(deno_path_) && file_exists(mpv_path_);
 }
 
 std::string AudioBackend::readiness_error() const {
-    if (!file_exists(yt_dlp_path_)) {
-        return "Missing tools/yt-dlp.exe";
+    std::vector<std::string> missing;
+    if (!file_exists(yt_dlp_path_)) missing.emplace_back("yt-dlp.exe");
+    if (!file_exists(deno_path_)) missing.emplace_back("deno.exe (required for full YouTube extraction)");
+    if (!file_exists(mpv_path_)) missing.emplace_back("mpv.exe");
+    if (missing.empty()) return {};
+
+    std::ostringstream out;
+    out << "Missing runtime: ";
+    for (std::size_t i = 0; i < missing.size(); ++i) {
+        if (i > 0) out << ", ";
+        out << missing[i];
     }
-    if (!file_exists(mpv_path_)) {
-        return "Missing tools/mpv/mpv.exe";
-    }
-    return {};
+    out << ". Keep PcYoutube.exe together with the complete tools folder.";
+    return out.str();
+}
+
+std::string AudioBackend::runtime_summary() const {
+    std::ostringstream out;
+    out << "yt-dlp=" << (yt_dlp_path_.empty() ? "missing" : wide_to_utf8(yt_dlp_path_.wstring()))
+        << " | deno=" << (deno_path_.empty() ? "missing" : wide_to_utf8(deno_path_.wstring()))
+        << " | mpv=" << (mpv_path_.empty() ? "missing" : wide_to_utf8(mpv_path_.wstring()));
+    return out.str();
 }
 
 std::vector<SearchTrack> AudioBackend::search(std::string_view query, int max_results,
@@ -249,7 +298,7 @@ std::vector<SearchTrack> AudioBackend::search(std::string_view query, int max_re
     error.clear();
     std::vector<SearchTrack> tracks;
     if (!file_exists(yt_dlp_path_)) {
-        error = "yt-dlp.exe is missing from the tools folder.";
+        error = "yt-dlp.exe is missing. Keep the complete tools folder beside PcYoutube.exe.";
         return tracks;
     }
 
@@ -259,9 +308,14 @@ std::vector<SearchTrack> AudioBackend::search(std::string_view query, int max_re
         return tracks;
     }
 
-    const std::vector<std::wstring> arguments = {
+    std::vector<std::wstring> arguments = {
         L"--no-config", L"--flat-playlist", L"--ignore-errors", L"--no-warnings",
-        L"--no-progress", L"--no-color", L"--dump-single-json", utf8_to_wide(target)};
+        L"--no-progress", L"--no-color", L"--dump-single-json"};
+    if (file_exists(deno_path_)) {
+        arguments.push_back(L"--js-runtimes");
+        arguments.push_back(L"deno:" + deno_path_.wstring());
+    }
+    arguments.push_back(utf8_to_wide(target));
 
     DWORD exit_code = 0;
     const std::string output = run_process_capture(yt_dlp_path_, arguments, exit_code);
@@ -286,24 +340,26 @@ std::vector<SearchTrack> AudioBackend::search(std::string_view query, int max_re
             track.channel = channel_from_json(entry);
             track.thumbnail_url = thumbnail_from_json(entry);
             track.duration = json_number(entry, "duration");
-            if (!track.id.empty() && !track.title.empty()) {
-                tracks.push_back(std::move(track));
-            }
+            if (!track.id.empty() && !track.title.empty()) tracks.push_back(std::move(track));
         }
     } catch (const std::exception& exception) {
         error = std::string("Could not parse yt-dlp search data: ") + exception.what();
     }
 
-    if (tracks.empty() && error.empty()) {
-        error = "No matching tracks were found.";
-    }
+    if (tracks.empty() && error.empty()) error = "No matching tracks were found.";
     return tracks;
 }
 
 BackendResult AudioBackend::resolve(std::string_view target, music::AudioQuality quality) const {
     BackendResult result;
     if (!file_exists(yt_dlp_path_)) {
-        result.error = "yt-dlp.exe is missing from the tools folder.";
+        result.error = "yt-dlp.exe is missing. Extract the complete v0.7 package.";
+        return result;
+    }
+    if (!file_exists(deno_path_)) {
+        result.error =
+            "deno.exe is missing. Full YouTube extraction now requires a JavaScript runtime; "
+            "extract the complete v0.7 package and keep tools/deno.exe beside tools/yt-dlp.exe.";
         return result;
     }
 
@@ -315,9 +371,9 @@ BackendResult AudioBackend::resolve(std::string_view target, music::AudioQuality
 
     const std::vector<std::wstring> arguments = {
         L"--no-config", L"--no-playlist", L"--no-warnings", L"--no-progress",
-        L"--no-color", L"--simulate", L"--format",
-        utf8_to_wide(music::quality_selector(quality)), L"--dump-single-json",
-        utf8_to_wide(resolved_target)};
+        L"--no-color", L"--js-runtimes", L"deno:" + deno_path_.wstring(),
+        L"--simulate", L"--format", utf8_to_wide(music::quality_selector(quality)),
+        L"--dump-single-json", utf8_to_wide(resolved_target)};
 
     DWORD exit_code = 0;
     const std::string output = run_process_capture(yt_dlp_path_, arguments, exit_code);
@@ -339,6 +395,7 @@ BackendResult AudioBackend::resolve(std::string_view target, music::AudioQuality
         track.format_id = json_string(item, "format_id");
         track.extension = json_string(item, "ext");
         track.codec = json_string(item, "acodec");
+        track.http_headers = headers_from_json(item);
         track.duration = json_number(item, "duration");
         track.abr_kbps = json_number(item, "abr");
         track.sample_rate_hz = json_number(item, "asr");
@@ -362,22 +419,24 @@ bool AudioBackend::start_mpv() {
     if (mpv_process_ != nullptr) {
         DWORD exit_code = 0;
         HANDLE process = reinterpret_cast<HANDLE>(mpv_process_);
-        if (GetExitCodeProcess(process, &exit_code) && exit_code == STILL_ACTIVE) {
-            return true;
-        }
+        if (GetExitCodeProcess(process, &exit_code) && exit_code == STILL_ACTIVE) return true;
         CloseHandle(process);
         mpv_process_ = nullptr;
     }
 
     if (!file_exists(mpv_path_)) {
+        last_error_ = "mpv.exe is missing from the runtime package.";
         return false;
     }
 
     mpv_pipe_name_ = L"\\\\.\\pipe\\PcYoutubeMpv_" + std::to_wstring(GetCurrentProcessId());
-    const std::vector<std::wstring> arguments = {
+    std::vector<std::wstring> arguments = {
         L"--idle=yes", L"--no-video", L"--audio-display=no", L"--force-window=no",
         L"--no-terminal", L"--really-quiet", L"--volume=" + std::to_wstring(volume_),
-        L"--input-ipc-server=" + mpv_pipe_name_};
+        L"--ytdl=yes", L"--input-ipc-server=" + mpv_pipe_name_};
+    if (file_exists(yt_dlp_path_)) {
+        arguments.push_back(L"--script-opts=ytdl_hook-ytdl_path=" + yt_dlp_path_.wstring());
+    }
 
     std::wstring command_line = quote_argument(mpv_path_.wstring());
     for (const auto& argument : arguments) {
@@ -396,6 +455,7 @@ bool AudioBackend::start_mpv() {
         mpv_path_.c_str(), command_line.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
         nullptr, working_directory.c_str(), &startup, &process);
     if (!created) {
+        last_error_ = "Could not start mpv.exe. Win32 error=" + std::to_string(GetLastError());
         return false;
     }
 
@@ -406,22 +466,18 @@ bool AudioBackend::start_mpv() {
 
 bool AudioBackend::send_command(std::string_view json_command, std::string* response) {
     std::lock_guard lock(mpv_mutex_);
-    if (!start_mpv()) {
-        return false;
-    }
+    if (!start_mpv()) return false;
 
     HANDLE pipe = INVALID_HANDLE_VALUE;
-    for (int attempt = 0; attempt < 40; ++attempt) {
+    for (int attempt = 0; attempt < 60; ++attempt) {
         pipe = CreateFileW(mpv_pipe_name_.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                            OPEN_EXISTING, 0, nullptr);
         if (pipe != INVALID_HANDLE_VALUE) break;
-        if (GetLastError() == ERROR_PIPE_BUSY) {
-            WaitNamedPipeW(mpv_pipe_name_.c_str(), 100);
-        } else {
-            Sleep(25);
-        }
+        if (GetLastError() == ERROR_PIPE_BUSY) WaitNamedPipeW(mpv_pipe_name_.c_str(), 100);
+        else Sleep(25);
     }
     if (pipe == INVALID_HANDLE_VALUE) {
+        last_error_ = "Could not connect to the mpv IPC pipe.";
         return false;
     }
 
@@ -431,18 +487,17 @@ bool AudioBackend::send_command(std::string_view json_command, std::string* resp
     const BOOL write_ok = WriteFile(pipe, line.data(), static_cast<DWORD>(line.size()),
                                     &written, nullptr);
     if (!write_ok || written != line.size()) {
+        last_error_ = "Could not send a command to mpv.";
         CloseHandle(pipe);
         return false;
     }
 
     if (response != nullptr) {
         response->clear();
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1200);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
         while (std::chrono::steady_clock::now() < deadline) {
             DWORD available = 0;
-            if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) {
-                break;
-            }
+            if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) break;
             if (available > 0) {
                 char buffer[4096];
                 DWORD read = 0;
@@ -461,14 +516,44 @@ bool AudioBackend::send_command(std::string_view json_command, std::string* resp
     return true;
 }
 
+bool AudioBackend::configure_http_headers(const TrackInfo& track) {
+    json values = json::array();
+    for (const auto& [name, value] : track.http_headers) {
+        if (!name.empty() && !value.empty()) values.push_back(name + ": " + value);
+    }
+    json command;
+    command["command"] = json::array({"set_property", "http-header-fields", values});
+    return send_command(command.dump());
+}
+
+void AudioBackend::cancel_playback_watch() {
+    if (!playback_watch_thread_.joinable()) return;
+    playback_watch_thread_.request_stop();
+    if (playback_watch_thread_.get_id() != std::this_thread::get_id()) {
+        playback_watch_thread_.join();
+    }
+}
+
+void AudioBackend::arm_playback_fallback(const TrackInfo& track) {
+    playback_watch_thread_ = std::jthread([this, track](std::stop_token token) {
+        for (int i = 0; i < 70 && !token.stop_requested(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (token.stop_requested()) return;
+
+        const bool idle = query_bool("idle-active").value_or(false);
+        if (!idle || token.stop_requested()) return;
+
+        play_via_extractor(track);
+    });
+}
+
 std::optional<double> AudioBackend::query_number(std::string_view property) {
     static std::atomic_uint request_id{1};
     const unsigned id = request_id.fetch_add(1);
     json command = {{"command", {"get_property", std::string(property)}}, {"request_id", id}};
     std::string response;
-    if (!send_command(command.dump(), &response)) {
-        return std::nullopt;
-    }
+    if (!send_command(command.dump(), &response)) return std::nullopt;
     const auto newline = response.find('\n');
     if (newline != std::string::npos) response.resize(newline);
     try {
@@ -487,9 +572,7 @@ std::optional<bool> AudioBackend::query_bool(std::string_view property) {
     const unsigned id = request_id.fetch_add(1);
     json command = {{"command", {"get_property", std::string(property)}}, {"request_id", id}};
     std::string response;
-    if (!send_command(command.dump(), &response)) {
-        return std::nullopt;
-    }
+    if (!send_command(command.dump(), &response)) return std::nullopt;
     const auto newline = response.find('\n');
     if (newline != std::string::npos) response.resize(newline);
     try {
@@ -504,8 +587,37 @@ std::optional<bool> AudioBackend::query_bool(std::string_view property) {
 }
 
 bool AudioBackend::play(const TrackInfo& track) {
-    if (track.direct_url.empty()) return false;
+    cancel_playback_watch();
+    last_error_.clear();
+    if (track.direct_url.empty()) {
+        last_error_ = "The resolved track has no direct media URL.";
+        return false;
+    }
+    if (!configure_http_headers(track)) return false;
     json command = {{"command", {"loadfile", track.direct_url, "replace"}}};
+    if (!send_command(command.dump())) return false;
+    arm_playback_fallback(track);
+    return true;
+}
+
+bool AudioBackend::play_via_extractor(const TrackInfo& track) {
+    last_error_.clear();
+    if (!file_exists(yt_dlp_path_)) {
+        last_error_ = "Fallback playback cannot run because yt-dlp.exe is missing.";
+        return false;
+    }
+    if (!file_exists(deno_path_)) {
+        last_error_ = "Fallback playback cannot run because deno.exe is missing.";
+        return false;
+    }
+    if (track.webpage_url.empty()) {
+        last_error_ = "Fallback playback has no YouTube source URL.";
+        return false;
+    }
+
+    TrackInfo empty_headers;
+    if (!configure_http_headers(empty_headers)) return false;
+    json command = {{"command", {"loadfile", track.webpage_url, "replace"}}};
     return send_command(command.dump());
 }
 
@@ -516,6 +628,8 @@ bool AudioBackend::toggle_pause() {
 }
 
 bool AudioBackend::stop() {
+    cancel_playback_watch();
+    if (mpv_process_ == nullptr) return true;
     return send_command(R"({"command":["stop"]})");
 }
 
@@ -527,6 +641,7 @@ bool AudioBackend::seek(double seconds) {
 
 bool AudioBackend::set_volume(int volume) {
     volume_ = std::clamp(volume, 0, 100);
+    if (mpv_process_ == nullptr) return true;
     json command = {{"command", {"set_property", "volume", volume_}}};
     return send_command(command.dump());
 }
@@ -549,11 +664,12 @@ PlaybackSnapshot AudioBackend::snapshot() {
 }
 
 void AudioBackend::shutdown() {
+    cancel_playback_watch();
     if (mpv_process_ == nullptr) return;
 
     send_command(R"({"command":["quit"]})");
     HANDLE process = reinterpret_cast<HANDLE>(mpv_process_);
-    if (WaitForSingleObject(process, 500) == WAIT_TIMEOUT) {
+    if (WaitForSingleObject(process, 700) == WAIT_TIMEOUT) {
         TerminateProcess(process, 0);
         WaitForSingleObject(process, 500);
     }
