@@ -1,6 +1,6 @@
 # Third-party components
 
-PcYoutube Music v0.5 uses two runtime tools and two source dependencies fetched at build time.
+PcYoutube Music v0.6 uses two runtime tools and two source dependencies fetched at build time.
 
 ## yt-dlp
 
@@ -30,7 +30,9 @@ PcYoutube Music v0.5 uses two runtime tools and two source dependencies fetched 
 
 - Project: https://github.com/nlohmann/json
 - Version/tag: `v3.12.0`
-- Purpose: parse structured yt-dlp/mpv data and persist user playlists as JSON.
+- Purpose: parse structured yt-dlp/mpv data and persist user playlists/settings as JSON.
 - License: MIT.
+
+Windows-native WinHTTP and Windows Imaging Component are used for v0.6 thumbnail download/decoding; they are operating-system components rather than bundled third-party libraries.
 
 GitHub Actions fetches source dependencies during CMake configure and downloads the yt-dlp/mpv runtime binaries while creating the Windows artifact.
